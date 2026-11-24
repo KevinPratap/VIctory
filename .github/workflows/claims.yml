@@ -1,0 +1,51 @@
+name: Claims
+
+# Reads the coordination issue (.github/forge.toml) and keeps CLAIMS.md on
+# forge/status and one bot comment in the issue current, by the rules in
+# docs/forge.md ("Claims"). On every comment in that issue, and every 30
+# minutes (so claims expire on time and pull request states are seen).
+on:
+  issue_comment:
+    types: [created, edited, deleted]
+  issues:
+    types: [edited]
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: claims
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  claims:
+    # Only the coordination issue's events (not every pull request comment).
+    if: >
+      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
+      github.event.issue.title == 'Coordinating who works on what'
+    runs-on: ubuntu-latest
+    # CLAIMS.md on forge/status; the bot's own comment in the issue.
+    permissions:
+      contents: write
+      issues: write
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: claims
+      - name: Claims
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask claims --out "$RUNNER_TEMP/claims" --comment
+      - name: Publish CLAIMS.md
+        run: |
+          git config --global user.name "VIctory Forge"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bash .github/forge-publish.sh "Claims $(date -u +'%Y-%m-%d %H:%M UTC')" "$RUNNER_TEMP/claims/CLAIMS.md"

@@ -1,0 +1,23 @@
+# The Forge and claims: docs/forge.md.
+
+# The issue where work is claimed (`claiming: <ID>`, `done: <ID> -> #<PR>`,
+# `release: <ID>`, `finding: <one line>`).
+coordination_issue = 1633
+
+# A claim without a pull request expires after this many days.
+claim_expiry_days = 14
+
+# Pull requests kept out of forge/main although they build: observed to break
+# the title. Each names the commit it was seen on (a prefix); a new commit lifts
+# the hold. What the build or the asset policy catches needs no hold.
+[[hold]]
+pr = 324
+head = "8fc3a1bb2f37"
+reason = "In the title: refuses TLS arrays the loader read leniently, and the title stops loading (RTX 4050 Laptop, 2026-11-24)."
+
+# Open work can be listed here as well as in the coordination issue's table:
+# [[task]]
+# id = "AREA-NAME"
+# what = "what needs doing"
+# where = "files"
+# needs = "game files, a GPU, or none"

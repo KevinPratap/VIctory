@@ -1,0 +1,58 @@
+name: Forge
+
+# Rebuilds forge/main (main plus every open pull request that merges, builds
+# and passes the asset policy) and publishes STATUS.md on forge/status, by
+# the rules in docs/forge.md. Every 12 hours, or by hand from the Actions tab.
+on:
+  schedule:
+    - cron: "0 0,12 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+# One run at a time; a scheduled run waits for a manual one.
+concurrency:
+  group: forge
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  forge:
+    runs-on: windows-latest
+    # Pushes forge/main and forge/status; nothing else.
+    permissions:
+      contents: write
+    timeout-minutes: 345
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Pinned to full commit SHAs, as in ci.yml.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: forge
+      - name: Git identity for the merge commits
+        run: |
+          git config --global user.name "VIctory Forge"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: The last run's status
+        run: git fetch -q origin forge/status && git show FETCH_HEAD:STATUS.md > "$RUNNER_TEMP/previous.md" || true
+      # xtask is built from main before the checkout moves to forge/main.
+      - name: Forge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          cargo xtask forge --out "$RUNNER_TEMP/forge" --tests
+          $( [ -s "$RUNNER_TEMP/previous.md" ] && echo --previous "$RUNNER_TEMP/previous.md" )
+      - name: Publish forge/main
+        run: git push --force origin forge/main
+      - name: Publish STATUS.md
+        run: |
+          git checkout -q --detach origin/main
+          bash .github/forge-publish.sh "Forge status $(date -u +'%Y-%m-%d %H:%M UTC')" "$RUNNER_TEMP/forge/STATUS.md"
