@@ -140,7 +140,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        view_marks: false,
+        options: super::Options::default(),
     })?;
 
     let shader = HostShader {
