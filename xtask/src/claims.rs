@@ -266,6 +266,10 @@ pub fn run(root: &Path, slug: &str, cfg: &Config, out: &Path, comment: bool) -> 
                 }
                 _ => {
                     for id in &ids {
+                        // Out of the queue too, when waiting behind another holder.
+                        if let Some(w) = waiting.get_mut(id) {
+                            w.retain(|x| x.user != c.user);
+                        }
                         if claims.get(id).is_some_and(|h| h.user == c.user) {
                             claims.remove(id);
                             done.remove(id);
