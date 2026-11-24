@@ -64,6 +64,9 @@ pub(crate) struct Lowered {
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
+    /// Total thread-group shared memory dwords (title + emulation scratch).
+    #[cfg(test)]
+    pub lds_dwords: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -538,6 +541,15 @@ fn compute_sections(p: &Program) -> (Sections, HashSet<Value>) {
         }
     }
     (sections, section_out)
+}
+
+/// Whether instruction `(b, i)` lies inside a recognized whole-wave section
+/// (`start + 1 .. sec.end`), where `Lower::run` routes it through `section_inst`
+/// instead of `inst`.
+fn in_sections(sections: &Sections, b: usize, i: usize) -> bool {
+    sections
+        .get(&b)
+        .is_some_and(|secs| secs.iter().any(|(&start, sec)| i > start && i < sec.end))
 }
 
 /// Immediate post-dominator per block (or virtual exit `n`) using Cooper-Harvey-Kennedy.
@@ -1053,10 +1065,13 @@ impl<'a> Lower<'a> {
             };
             let has_lds_mem = insts()
                 .any(|i| matches!(i.fields, Fields::Ds { .. }) && i.name() != "ds_swizzle_b32");
-            let has_swizzle_or_dpp = insts().any(|i| {
-                i.name().starts_with("ds_swizzle")
-                    || i.name().contains("permute")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+            let has_swizzle_or_dpp = p.blocks.iter().enumerate().any(|(b, blk)| {
+                blk.insts.iter().enumerate().any(|(i, inst)| {
+                    !in_sections(&sections, b, i)
+                        && (inst.name().starts_with("ds_swizzle")
+                            || inst.name().contains("permute")
+                            || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some()))
+                })
             });
 
             match req_mode {
@@ -1081,7 +1096,9 @@ impl<'a> Lower<'a> {
                     });
                     let has_unresolved_readlane = p.blocks.iter().enumerate().any(|(b, blk)| {
                         blk.insts.iter().enumerate().any(|(i, inst)| {
-                            inst.name() == "v_readlane_b32" && !spills.contains_key(&(b, i))
+                            !in_sections(&sections, b, i)
+                                && inst.name() == "v_readlane_b32"
+                                && !spills.contains_key(&(b, i))
                         })
                     });
                     let need_emu =
@@ -2511,6 +2528,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
+            #[cfg(test)]
+            lds_dwords: self.s.lds_dwords,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
