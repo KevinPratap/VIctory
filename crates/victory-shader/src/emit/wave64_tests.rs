@@ -2,7 +2,7 @@
 //! using synthetic GFX10 machine code on hardware GPU and WARP.
 
 use super::container::{self, SigElement};
-use super::{HostShader, TranslateOptions, Wave64Mode, emit_with, translate_with};
+use super::{HostShader, Options, Wave64Mode, emit_with, translate_with};
 use crate::dxbc::{Container, FourCC};
 use crate::native::{
     ComputeIo, HwStage, MeshIo, NativeProgram, PsInput, RootParam, RootType, StageIo, Usage,
@@ -283,7 +283,10 @@ fn lower_cs(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        options: TranslateOptions { wave64: mode },
+        options: Options {
+            wave64: mode,
+            ..Default::default()
+        },
     })
 }
 
@@ -309,7 +312,10 @@ fn emit_program(
         &st,
         &io_res,
         &res,
-        TranslateOptions { wave64: mode },
+        Options {
+            wave64: mode,
+            ..Default::default()
+        },
     )
 }
 
@@ -977,24 +983,27 @@ fn translate_with_handles_synthetic_wave64_container() {
 
     let sh_n = translate_with(
         &dxbc,
-        TranslateOptions {
+        Options {
             wave64: Wave64Mode::Native,
+            ..Default::default()
         },
     )
     .unwrap();
     assert_eq!(psv_wave_range(&sh_n), (64, 64));
     let sh_w32 = translate_with(
         &dxbc,
-        TranslateOptions {
+        Options {
             wave64: Wave64Mode::Wave32,
+            ..Default::default()
         },
     )
     .unwrap();
     assert_eq!(psv_wave_range(&sh_w32), (32, 32));
     let sh_emu = translate_with(
         &dxbc,
-        TranslateOptions {
+        Options {
             wave64: Wave64Mode::Emulate,
+            ..Default::default()
         },
     )
     .unwrap();

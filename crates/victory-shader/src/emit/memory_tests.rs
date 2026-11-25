@@ -547,7 +547,10 @@ fn writes_through_views_mark_their_pages() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        view_marks: true,
+        options: super::Options {
+            view_marks: true,
+            ..Default::default()
+        },
     })
     .expect("lower");
     assert!(l.view_marks && !l.memory, "marks without the page table");

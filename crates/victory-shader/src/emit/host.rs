@@ -2004,6 +2004,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            view_marks: false,
             memory: false,
             memory_writes: false,
             view_addresses: false,
