@@ -1020,22 +1020,29 @@ fn into_destination(
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
+    let mut pages = vec![0usize; (offset + len).div_ceil(PAGE)];
+    let snapshot = |dst: &mut [usize]| {
+        let src = request.destination.cast::<usize>();
+        for (i, slot) in dst.iter_mut().enumerate() {
+            // SAFETY: the title passes a page number per 64 KiB of destination
+            // (aligned for `usize`, as the read needs). A relaxed atomic load
+            // into a local buffer races with the title's writes without a data
+            // race, and creates no shared slice over memory it may still be
+            // populating.
+            *slot = unsafe {
+                std::sync::atomic::AtomicUsize::from_ptr(src.add(i)).load(Ordering::Relaxed)
+            };
+        }
     };
+    snapshot(&mut pages);
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
+    if super::xmem::write_physical(&pages, offset, &data[..n]) {
         return Ok(());
     }
     // Page number 0 is no page (numbers start at 0x10_0000): a list naming
@@ -1047,11 +1054,8 @@ fn into_destination(
     if pages.contains(&0) {
         for _ in 0..LATE_LIST_TRIES {
             std::thread::sleep(std::time::Duration::from_millis(1));
-            // SAFETY: as above; the title's list, read again.
-            let again = unsafe {
-                std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len())
-            };
-            if !again.contains(&0) && super::xmem::write_physical(again, offset, &data[..n]) {
+            snapshot(&mut pages);
+            if !pages.contains(&0) && super::xmem::write_physical(&pages, offset, &data[..n]) {
                 let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
                 if late.is_power_of_two() {
                     tracing::info!(
@@ -1067,7 +1071,7 @@ fn into_destination(
         offset,
         len,
         pages = pages.len(),
-        unknown = super::xmem::unknown_pages(pages),
+        unknown = super::xmem::unknown_pages(&pages),
         list = format_args!("{:x?}", &pages[..pages.len().min(8)]),
         options = format_args!("{:#x}", request.options),
         file = source_name(request),
