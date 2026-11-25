@@ -117,15 +117,39 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let wave64 = effective_wave64_mode();
-    let options = victory_shader::emit::Options {
-        view_marks: true,
-        wave64,
+    let translate = |c: &[u8]| {
+        let mut first = None;
+        for &wave64 in lowerings(wave64) {
+            let options = victory_shader::emit::Options {
+                view_marks: true,
+                wave64,
+            };
+            match victory_shader::emit::translate_with(c, options) {
+                Ok(shader) => return Ok(shader),
+                Err(e) => {
+                    first.get_or_insert(e.to_string());
+                }
+            }
+        }
+        Err(first.unwrap_or_default())
     };
-    let translate =
-        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), wave64, container, translate),
         None => (translate(container), false),
+    }
+}
+
+/// The lowerings a translation tries in turn when `mode` is asked for. The
+/// two 64-lane emulations refuse different programs (Wave32 one with a
+/// cross-lane operation in divergent control flow, Emulate one with a
+/// `v_readfirstlane` there), so a program one refuses tries the other, then
+/// the native lowering, whose `WaveSize(64)` a 32-lane host may still refuse
+/// when it makes the pipeline. The refusal kept is the one of `mode`.
+fn lowerings(mode: Wave64Mode) -> &'static [Wave64Mode] {
+    match mode {
+        Wave64Mode::Native => &[Wave64Mode::Native],
+        Wave64Mode::Wave32 => &[Wave64Mode::Wave32, Wave64Mode::Emulate, Wave64Mode::Native],
+        Wave64Mode::Emulate => &[Wave64Mode::Emulate, Wave64Mode::Wave32, Wave64Mode::Native],
     }
 }
 
@@ -527,5 +551,13 @@ mod tests {
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
         assert_eq!(decode(&encode(&refusal)), Some(refusal));
         assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);
+    }
+
+    #[test]
+    fn a_lowering_refused_tries_the_other_emulation_then_native() {
+        use Wave64Mode::{Emulate, Native, Wave32};
+        assert_eq!(lowerings(Native), [Native]);
+        assert_eq!(lowerings(Wave32), [Wave32, Emulate, Native]);
+        assert_eq!(lowerings(Emulate), [Emulate, Wave32, Native]);
     }
 }
