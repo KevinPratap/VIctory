@@ -180,6 +180,27 @@ Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
 the translated shaders do not require it at runtime.
 
+### Tests on files from outside the repository
+
+A few tests compare against files that cannot be kept in the repository
+([asset policy](docs/asset-policy.md)). They read their paths from these
+variables; `cargo test --workspace` skips them.
+
+| Variable | Test | Points at |
+|----------|------|-----------|
+| `VICTORY_BCPACK_TABLES` | `victory-formats` `bcpack::tests::reference_chunks` (ignored) | The BCPack table file, for example `crates/victory-formats/src/bcpack-tables.bin` |
+| `VICTORY_BCPACK_CASES` | the same | A directory of packed chunks `<name>.bc<n>`, each with its expected decode `<name>.out` beside it |
+| `VICTORY_XMA_STREAMS` | `victory-formats` `xma::tests::walks_saved_streams` (ignored) | A directory of saved XMA input buffers `*.xma`, each with its context words `*.ctx` |
+| `VICTORY_XMA_REFERENCE` | `victory-formats` `xma::tests::matches_a_reference_decoder` (ignored) | A directory holding `mono.xmadata`/`mono.ref` and `stereo.xmadata`/`stereo.ref`, the `.ref` files being a reference decoder's 16-bit PCM |
+| `VICTORY_REF_PS`, `VICTORY_REF_VS` | `victory-shader` `emit::tests::stub_pipeline_is_created` (optional, Windows) | DXIL containers used instead of the test's own pixel and vertex shaders |
+
+An ignored test runs only when asked for:
+
+```powershell
+$env:VICTORY_XMA_STREAMS = 'D:\xma-streams'
+cargo test -p victory-formats --lib --locked walks_saved_streams -- --ignored
+```
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
