@@ -1225,7 +1225,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        view_marks: false,
+        options: super::Options::default(),
     })
     .expect("lower");
     let shader = HostShader {

@@ -1741,6 +1741,18 @@ impl<'a> Lower<'a> {
                 let r = self.binary(36, fa, fb);
                 self.as_int(r)
             }
+            Op::AddH => {
+                let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+                let fa = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[a]);
+                let fb = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[b]);
+                let sum = self.s.m.bin(c, Bin::Add, fa, fb);
+                self.s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[sum])
+            }
         }
     }
 
@@ -2277,6 +2289,7 @@ impl<'a> Lower<'a> {
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
+            (Op::AddH, _) => return Err("a wave reduction over 16-bit floats"),
             (Op::AddU | Op::AddF, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
                 let r = self.s.op(

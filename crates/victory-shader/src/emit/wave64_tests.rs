@@ -767,7 +767,7 @@ mod gpu {
     use std::sync::{Mutex, OnceLock};
 
     use super::*;
-    use crate::emit::host::{Dispatch, Host, View};
+    use crate::emit::host::{Dispatch, Host, Root, View};
 
     fn with_hosts(f: impl FnOnce(&[Option<Host>; 2])) {
         static HOSTS: OnceLock<Mutex<[Option<Host>; 2]>> = OnceLock::new();
@@ -816,12 +816,22 @@ mod gpu {
                     let (root, pso) = host
                         .compute_pipeline(&shader)
                         .unwrap_or_else(|e| panic!("{name} ({mode:?}, warp={warp}) PSO: {e}"));
+                    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                    let mut roots = vec![(0, Root::Constants(ud))];
+                    for (idx, &reg) in shader.root_srvs.iter().enumerate() {
+                        let data = if reg == crate::emit::VIEW_STRIDES {
+                            vec![4]
+                        } else {
+                            vec![0; 4]
+                        };
+                        roots.push((1 + idx as u32, Root::View { srv: true, data }));
+                    }
                     let out = host
                         .dispatch(
                             &root,
                             &pso,
                             &Dispatch {
-                                roots: Vec::new(),
+                                roots,
                                 views: &[View::RawUav(uav_dwords)],
                                 samplers: &[],
                                 groups,
