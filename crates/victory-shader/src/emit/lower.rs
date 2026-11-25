@@ -1098,7 +1098,7 @@ impl<'a> Lower<'a> {
             } else {
                 false
             };
-            if has_non_uniform_firstlane {
+            if x.native.wave64 && has_non_uniform_firstlane {
                 console_lanes = true;
             }
 
