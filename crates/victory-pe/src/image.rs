@@ -349,6 +349,17 @@ fn entries<'data>(
     Ok(entries)
 }
 
+fn export_rva(address: u64, image_base: u64) -> Result<u32, PeError> {
+    address
+        .checked_sub(image_base)
+        .and_then(|d| u32::try_from(d).ok())
+        .ok_or_else(|| {
+            PeError::Malformed(format!(
+                "export address {address:#x} outside image base {image_base:#x}"
+            ))
+        })
+}
+
 fn parse_exports(file: &PeFile64<'_>, image_base: u64) -> Result<Vec<ExportInfo>, PeError> {
     use object::read::{ExportFlags, ExportTarget as ReadTarget, NameOrOrdinal};
 
@@ -369,9 +380,7 @@ fn parse_exports(file: &PeFile64<'_>, image_base: u64) -> Result<Vec<ExportInfo>
             };
             let (rva, forward) = match e.target() {
                 // The generic iterator adds the image base to an address.
-                ReadTarget::Address { address } => {
-                    (Some(address.wrapping_sub(image_base) as u32), None)
-                }
+                ReadTarget::Address { address } => (Some(export_rva(address, image_base)?), None),
                 ReadTarget::Reexport { library, name } => {
                     let symbol = match name {
                         NameOrOrdinal::Name(name) => utf8(name),
@@ -859,5 +868,19 @@ mod tests {
                 (Some("gamma"), 2, Some(0x1204)),
             ]
         );
+    }
+
+    #[test]
+    fn export_rva_rejects_underflow_and_u32_overflow() {
+        let base = 0x1_4000_0000;
+        assert_eq!(export_rva(base + 0x1200, base).unwrap(), 0x1200);
+        assert!(matches!(
+            export_rva(base - 1, base),
+            Err(PeError::Malformed(_))
+        ));
+        assert!(matches!(
+            export_rva(base + u64::from(u32::MAX) + 1, base),
+            Err(PeError::Malformed(_))
+        ));
     }
 }
