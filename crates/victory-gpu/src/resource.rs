@@ -3566,62 +3566,172 @@ mod tests {
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
-        let (mut image, mut source, mut target) = (null, null, null);
-        let created = |desc: &ResourceDesc, state, out: &mut This| {
-            assert_eq!(create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), iid, out), S_OK);
-        };
-        created(&texture(4, 4, 28, 1), COPY_DEST, &mut image);
-        created(&buffer(1024), 0, &mut source);
-        created(&buffer(4096), 0, &mut target);
-        let (data, _) = buffer_bytes(source).unwrap();
-        // SAFETY: the buffer holds 1024 bytes.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(data, 1024) };
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = (i % 251) as u8;
+        let mut failures = Vec::new();
+        for (format, depth) in [(28, false), (40, true), (39, true), (55, true), (53, true)] {
+            let height = if depth { 2 } else { 4 };
+            let element = element(format).unwrap().0 as usize;
+            let (mut image, mut source, mut target) = (null, null, null);
+            let created = |desc: &ResourceDesc, state, out: &mut This| {
+                assert_eq!(
+                    create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), iid, out),
+                    S_OK
+                );
+            };
+            let mut desc = texture(4, height, format, 1);
+            if depth {
+                desc.flags = 2; // ALLOW_DEPTH_STENCIL
+            }
+            created(&desc, COPY_DEST, &mut image);
+            created(&buffer(1024), 0, &mut source);
+            created(&buffer(4096), 0, &mut target);
+            let (data, _) = buffer_bytes(source).unwrap();
+            // SAFETY: the buffer holds 1024 bytes.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(data, 1024) };
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+            if depth {
+                let (left, right) = if element == 4 {
+                    (0.25_f32.to_bits(), 0.75_f32.to_bits())
+                } else {
+                    (0x4000, 0xbfff)
+                };
+                for row in 0..2 {
+                    for (x, value) in [left, left, right, right].into_iter().enumerate() {
+                        let at = row * 256 + x * element;
+                        bytes[at..at + element].copy_from_slice(&value.to_le_bytes()[..element]);
+                    }
+                }
+            }
+            let (out, _) = buffer_bytes(target).unwrap();
+            // SAFETY: the buffer holds 4096 bytes.
+            unsafe { std::ptr::write_bytes(out, 0xEE, 4096) };
+            let (mut queue, mut allocator, mut list) = (null, null, null);
+            let queue_desc = [0u32; 4];
+            assert_eq!(
+                crate::queue::create(
+                    null,
+                    queue_desc.as_ptr().cast(),
+                    &guid(
+                        0x0ec870a6,
+                        0x5d7e,
+                        0x4c22,
+                        [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]
+                    ),
+                    &mut queue
+                ),
+                S_OK
+            );
+            assert_eq!(
+                crate::list::create_allocator(
+                    null,
+                    0,
+                    &guid(
+                        0x6102dee4,
+                        0xaf59,
+                        0x4b09,
+                        [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]
+                    ),
+                    &mut allocator
+                ),
+                S_OK
+            );
+            assert_eq!(
+                crate::list::create_list(
+                    null,
+                    0,
+                    0,
+                    allocator,
+                    null,
+                    &guid(
+                        0x5b160d0f,
+                        0xac1b,
+                        0x4185,
+                        [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]
+                    ),
+                    &mut list
+                ),
+                S_OK
+            );
+            #[repr(C)]
+            struct Location {
+                resource: This,
+                kind: u32,
+                footprint: PlacedFootprint,
+            }
+            let rows = PlacedFootprint {
+                offset: 0,
+                format,
+                width: 4,
+                height,
+                depth: 1,
+                row_pitch: 256,
+            };
+            let image_at = Location {
+                resource: image,
+                kind: 0,
+                footprint: rows,
+            };
+            let from_source = Location {
+                resource: source,
+                kind: 1,
+                footprint: rows,
+            };
+            let into_target = Location {
+                resource: target,
+                kind: 1,
+                footprint: PlacedFootprint {
+                    offset: 512,
+                    ..rows
+                },
+            };
+            type Copy =
+                extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+            let copy = slot::<Copy>(list, 0x80);
+            copy(list, &image_at, 0, 0, 0, &from_source, null.cast());
+            let mut want = vec![0xEEu8; 4096];
+            if depth {
+                copy(list, &into_target, 0, 0, 0, &image_at, null.cast());
+                for row in 0..2 {
+                    let from = row * 256;
+                    let to = 512 + from;
+                    want[to..to + 4 * element].copy_from_slice(&bytes[from..from + 4 * element]);
+                }
+            } else {
+                // Texels (1..3, 1..3) to (2, 1) in the destination.
+                let region: [u32; 6] = [1, 1, 0, 3, 3, 1];
+                copy(
+                    list,
+                    &into_target,
+                    2,
+                    1,
+                    0,
+                    &image_at,
+                    region.as_ptr().cast(),
+                );
+                for row in 0..2 {
+                    let (to, from) = (512 + (1 + row) * 256 + 2 * 4, (1 + row) * 256 + 4);
+                    want[to..to + 8].copy_from_slice(&bytes[from..from + 8]);
+                }
+            }
+            assert_eq!(
+                slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+                S_OK
+            );
+            slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+            // SAFETY: the buffer holds 4096 bytes; the submission has run.
+            let read = unsafe { std::slice::from_raw_parts(out, 4096) };
+            if read != want {
+                failures.push((format, read.iter().all(|&byte| byte == 0xEE)));
+            }
+            for object in [list, allocator, queue, image, source, target] {
+                slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+            }
         }
-        let (out, _) = buffer_bytes(target).unwrap();
-        // SAFETY: the buffer holds 4096 bytes.
-        unsafe { std::ptr::write_bytes(out, 0xEE, 4096) };
-        let (mut queue, mut allocator, mut list) = (null, null, null);
-        let queue_desc = [0u32; 4];
-        assert_eq!(
-            crate::queue::create(null, queue_desc.as_ptr().cast(), &guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]), &mut queue),
-            S_OK
+        assert!(
+            failures.is_empty(),
+            "(format, untouched buffer): {failures:?}"
         );
-        assert_eq!(
-            crate::list::create_allocator(null, 0, &guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]), &mut allocator),
-            S_OK
-        );
-        assert_eq!(
-            crate::list::create_list(null, 0, 0, allocator, null, &guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]), &mut list),
-            S_OK
-        );
-        #[repr(C)]
-        struct Location {
-            resource: This,
-            kind: u32,
-            footprint: PlacedFootprint,
-        }
-        let rows = PlacedFootprint { offset: 0, format: 28, width: 4, height: 4, depth: 1, row_pitch: 256 };
-        let image_at = Location { resource: image, kind: 0, footprint: rows };
-        let from_source = Location { resource: source, kind: 1, footprint: rows };
-        // Texels (1..3, 1..3) into the target's footprint at 512, at texel (2, 1).
-        let into_target = Location { resource: target, kind: 1, footprint: PlacedFootprint { offset: 512, ..rows } };
-        let region: [u32; 6] = [1, 1, 0, 3, 3, 1];
-        type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
-        let copy = slot::<Copy>(list, 0x80);
-        copy(list, &image_at, 0, 0, 0, &from_source, null.cast());
-        copy(list, &into_target, 2, 1, 0, &image_at, region.as_ptr().cast());
-        slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
-        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
-        // SAFETY: the buffer holds 4096 bytes; the submission has run.
-        let read = unsafe { std::slice::from_raw_parts(out, 4096) };
-        let mut want = vec![0xEEu8; 4096];
-        for row in 0..2 {
-            let (to, from) = (512 + (1 + row) * 256 + 2 * 4, (1 + row) * 256 + 4);
-            want[to..to + 8].copy_from_slice(&bytes[from..from + 8]);
-        }
-        assert!(read == want.as_slice(), "the region's rows, and nothing else");
     }
 
     /// An explicit RTV still inherits its typed resource format
