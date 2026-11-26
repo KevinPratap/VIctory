@@ -481,23 +481,27 @@ struct LoaderLock {
 #[cfg(windows)]
 impl LoaderLock {
     fn hold<T>(&self, f: impl FnOnce() -> T) -> T {
+        struct Guard<'a>(&'a LoaderLock);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                let mut owner = self.0.owner.lock().unwrap_or_else(|e| e.into_inner());
+                owner.1 -= 1;
+                if owner.1 == 0 {
+                    owner.0 = None;
+                    self.0.free.notify_one();
+                }
+            }
+        }
         let me = std::thread::current().id();
-        let lock = || self.owner.lock().unwrap_or_else(|e| e.into_inner());
         {
-            let mut owner = lock();
+            let mut owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
             while owner.0.is_some_and(|o| o != me) {
                 owner = self.free.wait(owner).unwrap_or_else(|e| e.into_inner());
             }
             *owner = (Some(me), owner.1 + 1);
         }
-        let result = f();
-        let mut owner = lock();
-        owner.1 -= 1;
-        if owner.1 == 0 {
-            owner.0 = None;
-            self.free.notify_one();
-        }
-        result
+        let _guard = Guard(self);
+        f()
     }
 }
 
@@ -557,6 +561,30 @@ mod tests {
         });
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn loader_lock_releases_on_panic_and_reentrant_unwind() {
+        let lock = Arc::new(super::LoaderLock::default());
+        let first = lock.clone();
+        assert!(
+            std::thread::spawn(move || {
+                first.hold(|| first.hold(|| panic!("unwind under loader lock")));
+            })
+            .join()
+            .is_err()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = lock.clone();
+        std::thread::spawn(move || {
+            let value = second.hold(|| 42);
+            let _ = tx.send(value);
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(42),
+            "loader lock stayed held after a panicking closure unwound"
+        );
     }
 
     #[test]
