@@ -128,6 +128,9 @@ To get into the game, press A (Enter) on each first-boot screen and again on
 the start screen. Loading the world takes about a minute; the intro cutscene
 plays, then the prologue starts.
 
+For a build to keep rather than iterate on, build with `--profile ship`
+(`target\ship\victory.exe`).
+
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
 [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
