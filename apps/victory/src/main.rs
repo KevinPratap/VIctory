@@ -89,7 +89,7 @@ enum Command {
         /// driver; a second time only what is not there yet).
         #[arg(long)]
         pipelines: bool,
-        /// Print one line per program and outcome.
+        /// Include runtime hashes and duplicate DXIL containers in the per-program listing.
         #[arg(long)]
         list: bool,
         /// Positive worker thread count (default: every logical core).
