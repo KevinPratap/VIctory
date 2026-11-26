@@ -1365,6 +1365,7 @@ impl<'a> Lower<'a> {
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
+                        self.mode16 = round16_after(&p.blocks[b].insts[j], self.mode16);
                     }
                     i = end;
                     continue;
