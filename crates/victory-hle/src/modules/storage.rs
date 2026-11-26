@@ -87,18 +87,32 @@ pub struct SpaceInfo {
     pub total: u64,
 }
 
+/// Bytes of the real files under `dir`. Junctions and other links are
+/// skipped rather than followed: a link into its own parent would loop a
+/// naive walk (the old recursion would overflow the stack on it), and one
+/// pointing elsewhere would charge foreign bytes to the title's quota.
 fn used_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|e| match e.metadata() {
-            Ok(m) if m.is_dir() => used_bytes(&e.path()),
-            Ok(m) => m.len(),
-            Err(_) => 0,
-        })
-        .sum()
+    let mut total = 0;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let Ok(kind) = e.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                pending.push(e.path());
+            } else if let Ok(meta) = e.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
 }
 
 /// What the host disk under `dir` has free (unlimited if unknown).
@@ -427,5 +441,33 @@ mod tests {
             assert_eq!(xasync::XAsyncGetStatus(&mut block, true), expect);
             assert_eq!(result(this, &mut block), expect, "{bytes} bytes");
         }
+    }
+
+    /// A junction into the tree itself or out of it must neither hang or
+    /// crash the quota count nor charge foreign bytes to the title.
+    #[cfg(windows)]
+    #[test]
+    fn used_bytes_skips_junctions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.dat"), [0u8; 10]).unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("b.dat"), [0u8; 5]).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("c.dat"), [0u8; 100]).unwrap();
+        let junction = |name: &str, target: &Path| {
+            let ok = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(dir.path().join(name))
+                .arg(target)
+                .status()
+                .unwrap();
+            assert!(ok.success(), "mklink /J {name}");
+        };
+        junction("cycle", dir.path());
+        junction("escape", outside.path());
+
+        // Only the two real files count; neither junction is walked.
+        assert_eq!(used_bytes(dir.path()), 15);
     }
 }
