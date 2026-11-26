@@ -1752,6 +1752,80 @@ mod tests {
         View::map(&slice, 1).expect("mapped").bytes().to_vec()
     }
 
+    /// A live range the GPU reads in place (#1905) has to survive the two
+    /// things the title does to memory while it is being read: a protection
+    /// change over part of it — a 16 KiB stack guard inside a live range is
+    /// normal — and a remap of part of it. Neither may lose the bytes on
+    /// either side, and neither may leave the run model claiming one run
+    /// where there are two.
+    #[test]
+    fn a_live_range_survives_a_guard_page_and_a_remap() {
+        use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
+        let pages = allocate(4);
+        // SAFETY: plain calls with valid pointers; the memory is committed.
+        unsafe {
+            let range = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                4 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!range.is_null());
+            assert_eq!(XMemMapPhysicalPages(range, 4, pages.as_ptr()), range);
+            let at = |page: usize| range.cast::<u8>().wrapping_byte_add(page * PAGE);
+            for page in 0..4 {
+                at(page).write(0x11 * (page as u8 + 1));
+            }
+
+            // A 16 KiB guard inside the second page, then back to read-write:
+            // the pages on both sides keep what they held.
+            let mut old = PAGE_READWRITE;
+            assert_ne!(
+                VirtualProtect(at(1).cast(), 16 << 10, PAGE_NOACCESS, &mut old),
+                0,
+                "a live range takes a protection change"
+            );
+            assert_eq!(at(0).read(), 0x11);
+            assert_eq!(at(3).read(), 0x44);
+            assert_ne!(VirtualProtect(at(1).cast(), 16 << 10, old, &mut old), 0);
+            for page in 0..4 {
+                assert_eq!(
+                    at(page).read(),
+                    0x11 * (page as u8 + 1),
+                    "page {page} keeps its bytes across a protection change"
+                );
+            }
+            assert_eq!(
+                runs(&pages, 0, 4 * PAGE).map(|r| r.iter().map(|&(_, n)| n).collect::<Vec<_>>()),
+                Some(vec![4]),
+                "the run model still sees one run"
+            );
+
+            // The remap half is where it stops, and this is the finding: a
+            // range that physical pages are mapped into is not a placeholder
+            // any more, so the title's "free half, reserve it again, map new
+            // pages there" step is refused. #1905 has to change this before
+            // #407 can have the GPU read memory in place across a remap.
+            assert_eq!(
+                VirtualFree(
+                    at(2).cast(),
+                    2 * PAGE,
+                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER
+                ),
+                0,
+                "a mapped range is not a placeholder to split"
+            );
+            // Nothing moved, and the range still reads as one run of four.
+            assert_eq!(at(0).read(), 0x11);
+            assert_eq!(at(3).read(), 0x44);
+            assert_eq!(
+                runs(&pages, 0, 4 * PAGE).map(|r| r.iter().map(|&(_, n)| n).collect::<Vec<_>>()),
+                Some(vec![4])
+            );
+        }
+    }
+
     #[test]
     fn freed_page_numbers_can_be_reused_at_the_limit() {
         // Seed a private allocator so parallel tests never see the artificial limit.
