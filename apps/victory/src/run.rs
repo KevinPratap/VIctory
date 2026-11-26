@@ -451,18 +451,42 @@ impl LateDlls {
             let Some((i, error)) = failed else {
                 return Ok(new.last().map(|(_, dll)| dll.base()));
             };
-            // As `LoadLibrary` does when a `DllMain` fails: detach what this
-            // load attached (the failed one too) and unmap all of it.
-            let bases: Vec<_> = new.iter().map(|(_, d)| d.base()).collect();
-            self.mapped
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .retain(|(_, d)| !bases.contains(&d.base()));
+            // As `LoadLibrary` does when a `DllMain` fails: detach any
+            // re-entrantly loaded modules that depend on `new` (in reverse
+            // load order), then detach `new` and unmap all of them.
+            let failed_bases: Vec<_> = new.iter().map(|(_, d)| d.base()).collect();
+            let failed_names: Vec<_> = new.iter().map(|(name, _)| name.as_str()).collect();
+            let dependents: Vec<_> = {
+                let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
+                let indices = reentrant_dependents(
+                    &mapped,
+                    &failed_bases,
+                    &failed_names,
+                    |(name, _)| name.as_str(),
+                    |(_, dll)| dll.base(),
+                    |(_, dll)| {
+                        dll.info()
+                            .imports
+                            .iter()
+                            .chain(&dll.info().delay_imports)
+                            .map(|m| m.dll.as_str())
+                    },
+                );
+                // `indices` is strictly descending, so earlier indices stay valid.
+                let dependents: Vec<_> =
+                    indices.into_iter().map(|idx| mapped.remove(idx)).collect();
+                mapped.retain(|(_, d)| !failed_bases.contains(&d.base()));
+                dependents
+            };
+            for (_, done) in &dependents {
+                // SAFETY: attached on this thread during `new`'s `attach`.
+                unsafe { done.detach() };
+            }
             for (_, done) in new[..=i].iter().rev() {
                 // SAFETY: attached (or failing to) on this thread just now.
                 unsafe { done.detach() };
             }
-            for (_, dll) in new {
+            for (_, dll) in dependents.into_iter().chain(new.into_iter().rev()) {
                 forget_image(dll.base());
                 // SAFETY: detached, and no title code holds it yet.
                 unsafe { dll.unload() };
@@ -470,6 +494,55 @@ impl LateDlls {
             Err(error)
         })
     }
+}
+
+/// Returns indices in `mapped` (in reverse load order) of modules appended
+/// re-entrantly after `failed_bases` that directly or transitively import any
+/// module in `failed_names` (case-insensitive).
+#[cfg(any(windows, test))]
+fn reentrant_dependents<'a, T, I>(
+    mapped: &'a [T],
+    failed_bases: &[usize],
+    failed_names: &[&str],
+    name: impl Fn(&'a T) -> &'a str,
+    base: impl Fn(&T) -> usize,
+    imports: impl Fn(&'a T) -> I,
+) -> Vec<usize>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let tail_start = mapped
+        .iter()
+        .rposition(|entry| failed_bases.contains(&base(entry)))
+        .map_or(mapped.len(), |idx| idx + 1);
+    let tail = &mapped[tail_start..];
+    let mut marked = vec![false; tail.len()];
+    let mut poisoned: Vec<&str> = failed_names.to_vec();
+    loop {
+        let mut changed = false;
+        for (offset, entry) in tail.iter().enumerate() {
+            if marked[offset] {
+                continue;
+            }
+            let depends = imports(entry)
+                .into_iter()
+                .any(|imp| poisoned.iter().any(|p| p.eq_ignore_ascii_case(imp)));
+            if depends {
+                marked[offset] = true;
+                poisoned.push(name(entry));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    marked
+        .iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(offset, &is_dep)| is_dep.then_some(tail_start + offset))
+        .collect()
 }
 
 /// The Windows loader lock's shape: one thread at a time, re-entered by
@@ -659,6 +732,83 @@ mod cpu_check_tests {
         assert!(starts_warm_up(Some("1")));
         assert!(!starts_warm_up(Some("0")));
         assert!(!starts_warm_up(Some("off")));
+    }
+}
+
+#[cfg(test)]
+mod reentrant_rollback_tests {
+    use super::reentrant_dependents;
+
+    fn rollback_names<'a>(
+        mapped: &'a [(&'a str, usize, &'a [&'a str])],
+        failed_bases: &[usize],
+        failed_names: &[&str],
+    ) -> Vec<&'a str> {
+        reentrant_dependents(
+            mapped,
+            failed_bases,
+            failed_names,
+            |(name, _, _)| *name,
+            |(_, base, _)| *base,
+            |(_, _, imps)| imps.iter().copied(),
+        )
+        .into_iter()
+        .map(|idx| mapped[idx].0)
+        .collect()
+    }
+
+    #[test]
+    fn direct_reentrant_dependent_is_rolled_back() {
+        let mapped = [
+            ("pre.dll", 1, &["kernel32.dll"][..]),
+            ("a.dll", 2, &["kernel32.dll"][..]),
+            ("b.dll", 3, &["a.dll"][..]),
+        ];
+        assert_eq!(rollback_names(&mapped, &[2], &["a.dll"]), ["b.dll"]);
+    }
+
+    #[test]
+    fn transitive_reentrant_dependents_rollback_in_reverse_load_order() {
+        let mapped = [
+            ("a.dll", 1, &["kernel32.dll"][..]),
+            ("b.dll", 2, &["a.dll"][..]),
+            ("c.dll", 3, &["b.dll"][..]),
+        ];
+        assert_eq!(
+            rollback_names(&mapped, &[1], &["a.dll"]),
+            ["c.dll", "b.dll"]
+        );
+    }
+
+    #[test]
+    fn independent_reentrant_modules_are_preserved() {
+        let mapped = [
+            ("pre.dll", 1, &["kernel32.dll"][..]),
+            ("a.dll", 2, &["kernel32.dll"][..]),
+            ("d.dll", 3, &["kernel32.dll", "pre.dll"][..]),
+            ("b.dll", 4, &["a.dll"][..]),
+            ("e.dll", 5, &["d.dll"][..]),
+            ("c.dll", 6, &["b.dll", "d.dll"][..]),
+        ];
+        assert_eq!(
+            rollback_names(&mapped, &[2], &["a.dll"]),
+            ["c.dll", "b.dll"]
+        );
+    }
+
+    #[test]
+    fn import_matching_ignores_ascii_case() {
+        let mapped = [
+            ("x.dll", 1, &["kernel32.dll"][..]),
+            ("a.dll", 2, &["x.dll"][..]),
+            ("b.dll", 3, &["A.DLL"][..]),
+            ("c.dll", 4, &["B.Dll"][..]),
+            ("d.dll", 5, &["X.Dll"][..]),
+        ];
+        assert_eq!(
+            rollback_names(&mapped, &[1, 2], &["x.dll", "a.dll"]),
+            ["d.dll", "c.dll", "b.dll"]
+        );
     }
 }
 
