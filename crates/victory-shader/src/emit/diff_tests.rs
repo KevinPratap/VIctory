@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::host::{Draw, Host, Root};
+use super::valu_tests::ONE_AT_A_TIME;
 use super::{HostShader, RootType, translate};
 
 const RS: &str = "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), \
@@ -833,6 +834,7 @@ fn translated_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let host = match Host::new(false) {
         Ok(host) => host,
         Err(e) => {
@@ -991,6 +993,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let host = match Host::new(false) {
         Ok(host) => host,
         Err(e) => {
@@ -1110,6 +1113,7 @@ fn float_semantics_are_the_consoles() {
         eprintln!("no console compiler; skipped");
         return;
     };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let host = match Host::new(false) {
         Ok(host) => host,
         Err(e) => {
@@ -1272,6 +1276,7 @@ fn cube_gradients_pick_the_level() {
         })
         .collect();
     let mut ran = 0;
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
@@ -1353,6 +1358,7 @@ fn translated_compute_matches_pc() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let host = match Host::new(false) {
         Ok(host) => host,
         Err(e) => {
