@@ -71,6 +71,8 @@ pub mod signature;
 mod switch;
 #[cfg(windows)]
 mod tdr;
+#[cfg(all(windows, test))]
+mod test_root;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
