@@ -125,6 +125,27 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
 
 /// Whether `device` runs on a software adapter (WARP); `true` when that
 /// cannot be told, so its work is serialised rather than raced.
+/// Whether structured buffer views are made raw, as victory-gpu makes them
+/// on NVIDIA, whose raw reads of a structured view read the wrong records
+/// (`victory_gpu`'s `buffer_srv`); `VICTORY_RAW_STRUCTURED=0` or `=1`
+/// decides instead.
+#[cfg(test)]
+fn raw_structured(device: &ID3D12Device) -> bool {
+    match std::env::var("VICTORY_RAW_STRUCTURED").as_deref() {
+        Ok("0") => return false,
+        Ok("1") => return true,
+        _ => {}
+    }
+    // SAFETY: plain D3D12/DXGI queries with valid pointers.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+            .and_then(|a| a.GetDesc1())
+            .is_ok_and(|d| d.VendorId == 0x10DE)
+    }
+}
+
 fn on_software_adapter(device: &ID3D12Device) -> bool {
     // SAFETY: plain D3D12/DXGI queries with valid pointers.
     unsafe {
@@ -2095,6 +2116,12 @@ impl Host {
                                 data.len() / 4,
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
+                            ),
+                            Stride::Structured(_) if raw_structured(dev) => (
+                                DXGI_FORMAT_R32_TYPELESS,
+                                data.len(),
+                                0,
+                                D3D12_BUFFER_SRV_FLAG_RAW,
                             ),
                             Stride::Structured(s) => (
                                 DXGI_FORMAT_UNKNOWN,

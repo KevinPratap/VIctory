@@ -46,3 +46,30 @@ pub enum ShaderError {
     #[error("GFX10 code at {offset:#x}: {what} is not supported")]
     Unsupported { offset: usize, what: &'static str },
 }
+
+// The D3D12 Agility SDK for this crate's GPU tests, as victory.exe loads it
+// (see its main.rs): Windows 10 has no shader model 6.6 without it. A test
+// binary is in target\<profile>\deps\, so the runtime is looked for in
+// target\<profile>\D3D12\ (where `D3D12Core.dll` from the NuGet package is
+// copied once); without that folder the system's runtime is used, as before.
+// Rust does not export statics from an executable, so the linker is told to
+// in the object itself (only test binaries link it).
+
+/// The Agility SDK version (the middle part of 1.620.x).
+#[cfg(test)]
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)] // the names Windows looks for
+pub static D3D12SDKVersion: u32 = 620;
+
+/// Where the Agility SDK runtime is, relative to the test binary.
+#[cfg(test)]
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)] // the names Windows looks for
+pub static D3D12SDKPath: &[u8; 10] = b"..\\D3D12\\\0";
+
+/// The linker directives exporting the two values above (MSVC's linker
+/// reads them from an object's `.drectve` section).
+#[cfg(all(test, target_env = "msvc"))]
+#[used]
+#[unsafe(link_section = ".drectve")]
+static D3D12_SDK_EXPORTS: [u8; 56] = *b" /EXPORT:D3D12SDKVersion,DATA /EXPORT:D3D12SDKPath,DATA ";
