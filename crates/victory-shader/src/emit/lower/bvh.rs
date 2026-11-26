@@ -195,9 +195,21 @@ impl Lower<'_> {
                 let nodes = match self.root_address(src) {
                     Some((root_lo, root_hi)) => {
                         self.s.flags |= super::flags::INT64;
+                        // The root descriptor carries the base directly (unlike the explicit
+                        // descriptor path below, which drops its low byte).
                         let base = wide64(self, root_lo, root_hi);
                         let zero = self.s.m.i32(0);
-                        let at = wide64(self, at, zero);
+                        let ptr = wide64(self, lo, node_hi.unwrap_or(zero));
+                        let k3 = self.s.m.int_const(i64t, 3);
+                        let off = self.s.m.bin(c, Bin::Shl, ptr, k3);
+                        // Sum the 32-bit offset pieces with 32-bit wraparound, then widen:
+                        // resource::Address::offset adds modulo 2^32 and carries into the high half.
+                        let mut sum = k;
+                        if let Some(d) = dynamic {
+                            sum = self.s.m.bin(c, Bin::Add, sum, d);
+                        }
+                        let sum = self.s.m.cast(c, Cast::ZExt, sum, i64t);
+                        let at = self.s.m.bin(c, Bin::Add, off, sum);
                         Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at))
                     }
                     None => Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at),
