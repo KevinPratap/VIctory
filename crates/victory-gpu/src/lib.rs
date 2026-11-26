@@ -86,6 +86,8 @@ mod title_copy;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
+mod unified;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(all(windows, feature = "diagnostics"))]

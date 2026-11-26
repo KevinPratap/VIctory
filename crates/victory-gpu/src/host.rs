@@ -42,6 +42,9 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    /// What its memory is like, and whether title memory opens in place
+    /// (`crate::unified`).
+    pub(crate) memory: crate::unified::Memory,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -114,6 +117,9 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
         }
+        // Whether the GPU shares memory with the CPU: what a report from an
+        // APU or a translation layer needs first.
+        text.push_str(&format!("; host GPU memory: {}", host.memory));
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
             None if host.messages.is_none() => text.push_str(
@@ -266,6 +272,8 @@ fn create() -> windows::core::Result<Host> {
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
+        let memory = crate::unified::detect(&device);
+        tracing::info!("host GPU memory: {memory}");
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -283,6 +291,7 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            memory,
             queue,
             fence,
             submitted: Mutex::new(0),
