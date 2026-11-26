@@ -374,10 +374,28 @@ fn wait_within(waits: &Waits, budget: Duration, p: &Pending, frame: u64) {
     }
 }
 
-/// Pipelines for the workers: those draws wait for, then those started
-/// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+/// Pipelines for the workers, in the order they take them: those draws
+/// wait for, those started early that write depth only, the other early
+/// ones ([`queue_index`]).
+static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 3]>, Condvar) =
+    (Mutex::new([const { VecDeque::new() }; 3]), Condvar::new());
+
+/// Which of [`QUEUES`] `p` goes in: one a draw waits for (`now`) first;
+/// of those started early, one that writes depth only (a shadow map or
+/// depth prepass, which several later draws read) before the others.
+fn queue_index(p: &Pending, now: bool) -> usize {
+    if now {
+        0
+    } else if p
+        .graphics
+        .as_deref()
+        .is_some_and(GraphicsState::writes_depth_only)
+    {
+        1
+    } else {
+        2
+    }
+}
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
@@ -406,7 +424,8 @@ fn queue(p: Arc<Pending>, now: bool) {
         return;
     }
     let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
+    let index = queue_index(&p, now);
+    lock.lock().unwrap_or_else(|e| e.into_inner())[index].push_back(p);
     work.notify_one();
 }
 
@@ -641,6 +660,33 @@ mod tests {
             let over = (*began).max(first + budget) + slack;
             assert!(*began + *waited <= over, "{waits:?}");
         }
+    }
+
+    /// Early starts that write depth only (no target, a depth format,
+    /// depth writes on) go before the other early starts; draws waiting go
+    /// before both.
+    #[test]
+    fn depth_only_pipelines_go_ahead_of_other_early_starts() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
+        let pending = |depth: bool| {
+            let mut g = Box::new(GraphicsState::default());
+            if depth {
+                let subobject = [16u32, DXGI_FORMAT_D32_FLOAT.0 as u32];
+                // SAFETY: a whole depth-format subobject of a stream.
+                unsafe { g.read(16, subobject.as_ptr().cast()) };
+            }
+            Pending::new(
+                Vec::new(),
+                Some(g),
+                #[cfg(feature = "diagnostics")]
+                &[],
+            )
+        };
+        let (shadow, other) = (pending(true), pending(false));
+        assert_eq!(queue_index(&shadow, false), 1);
+        assert_eq!(queue_index(&other, false), 2);
+        assert_eq!(queue_index(&shadow, true), 0);
+        assert_eq!(queue_index(&other, true), 0);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
