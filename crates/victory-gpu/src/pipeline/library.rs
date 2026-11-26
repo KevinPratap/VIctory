@@ -5,8 +5,11 @@
 //!    a hash of all that its host description holds (the translated
 //!    shaders' code, which changes when a translation does, our root
 //!    signature, the graphics state). The library is saved under the cache
-//!    folder; the host refuses a library of another adapter or driver, and
-//!    an entry whose description differs, so neither is ever used.
+//!    folder in [`SHARDS`] files, one per hash of the name, so a save writes
+//!    only the files that gained pipelines (the host serialises a whole
+//!    library and nothing less); the host refuses a library of another
+//!    adapter or driver, and an entry whose description differs, so neither
+//!    is ever used.
 //! 2. The title pipelines a run drew or dispatched with (made in time or
 //!    not) are listed by a key known when the title creates them (their
 //!    shader containers and graphics state); the next run hands those to
@@ -63,6 +66,13 @@ struct Library {
     /// key, and whether that list changed since the last save.
     prebuilt: HashSet<String>,
     prebuilt_changed: bool,
+}
+
+impl Library {
+    /// Whether it gained pipelines or pre-build keys since the last save.
+    fn dirty(&self) -> bool {
+        self.added > 0 || self.prebuilt_changed
+    }
 }
 
 // SAFETY: D3D12 objects are free-threaded (a pipeline library with the
@@ -133,25 +143,98 @@ const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
-fn library() -> Option<&'static Shared> {
-    static LIBRARY: OnceLock<Option<Shared>> = OnceLock::new();
-    LIBRARY
+/// How many files the library is kept in. The host only serialises a whole
+/// library, so a run that made a handful of pipelines wrote all of it (926 MB
+/// here, every 20 s, and closer to 1.7 GB on NVIDIA); with the names spread
+/// over shards, a save writes the shards that gained pipelines.
+const SHARDS: usize = 16;
+
+/// The file shard `shard` is kept in.
+fn shard_file(shard: usize) -> String {
+    format!("host-pipelines.{shard:02}.bin")
+}
+
+/// The pre-build's list for shard `shard`.
+fn prebuilt_file(shard: usize) -> String {
+    format!("prebuilt-pipelines.{shard:02}.txt")
+}
+
+/// The shard a pipeline named `name` belongs to. The name is a hash, so this
+/// is spread and stable across runs: a pipeline always lands in the same
+/// file, which is what lets a save write only the files that changed.
+fn shard_of(name: &str) -> usize {
+    let mut h = 0u32;
+    for b in name.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(u32::from(b));
+    }
+    h as usize % SHARDS
+}
+
+/// `blob` as a library with its pre-build list, if there is one.
+fn shard(device: &ID3D12Device1, blob: Vec<u8>, list: Option<Vec<u8>>) -> Option<Shared> {
+    let tag = tag(&blob);
+    let mut library = open(device, blob)?;
+    // The pre-build's list, if it was saved with these bytes.
+    if let Some(list) = list
+        && !library._blob.is_empty()
+    {
+        library.prebuilt = listed(&list, &tag);
+    }
+    Some(Shared { loads: library.library.clone(), state: Mutex::new(library) })
+}
+
+fn libraries() -> Option<&'static [Shared; SHARDS]> {
+    static LIBRARIES: OnceLock<Option<[Shared; SHARDS]>> = OnceLock::new();
+    LIBRARIES
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
-            let tag = tag(&blob);
-            let mut library = open(&device, blob);
-            // The pre-build's list, if it was saved with these bytes.
-            if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
-                && !l._blob.is_empty()
-            {
-                l.prebuilt = listed(&list, &tag);
+            let read = |file: String| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
+            let started = std::time::Instant::now();
+            let mut shards: Vec<Shared> = Vec::with_capacity(SHARDS);
+            let mut files = 0;
+            let mut bytes = 0;
+            for at in 0..SHARDS {
+                let blob = read(shard_file(at)).unwrap_or_default();
+                if !blob.is_empty() {
+                    files += 1;
+                    bytes += blob.len();
+                }
+                shards.push(shard(&device, blob, read(prebuilt_file(at)))?);
             }
-            if library.is_none() {
-                tracing::warn!("no host pipeline library: pipelines are not kept");
+            if files == 0 {
+                tracing::info!("no host pipeline library yet; starting an empty one");
+            } else {
+                tracing::info!(
+                    files,
+                    bytes,
+                    ms = started.elapsed().as_millis() as u64,
+                    "host pipeline library loaded"
+                );
             }
-            library.map(|l| Shared { loads: l.library.clone(), state: Mutex::new(l) })
+            shards.try_into().ok()
+        })
+        .as_ref()
+}
+
+/// The one-file library of earlier runs, read (never written) so a cache made
+/// before the shards is not lost: a pipeline found there is stored into its
+/// shard, so a warm run fills them and the file can then be deleted.
+fn legacy() -> Option<&'static Shared> {
+    static LEGACY: OnceLock<Option<Shared>> = OnceLock::new();
+    LEGACY
+        .get_or_init(|| {
+            let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+            let dir = DIR.get()?;
+            let blob = std::fs::read(dir.join(LIBRARY_FILE)).ok()?;
+            let list = std::fs::read(dir.join(PREBUILT_FILE)).ok();
+            let bytes = blob.len();
+            let shared = shard(&device, blob, list)?;
+            tracing::info!(
+                bytes,
+                file = LIBRARY_FILE,
+                "the one-file host pipeline library is still read: what it holds is stored into the shards as it is used"
+            );
+            Some(shared)
         })
         .as_ref()
 }
@@ -233,14 +316,17 @@ fn listed(list: &[u8], tag: &str) -> HashSet<String> {
 
 /// Whether the pre-build has the title pipeline `key` in the library.
 pub(crate) fn prebuilt(key: &str) -> bool {
-    library().is_some_and(|l| l.state.lock().unwrap_or_else(|e| e.into_inner()).prebuilt.contains(key))
+    fn holds(l: &'static Shared, key: &str) -> bool {
+        l.state.lock().unwrap_or_else(|e| e.into_inner()).prebuilt.contains(key)
+    }
+    libraries().is_some_and(|ls| holds(&ls[shard_of(key)], key)) || legacy().is_some_and(|l| holds(l, key))
 }
 
 /// The pre-build has the title pipeline `key` in the library now.
 pub(crate) fn note_prebuilt(key: String) {
-    if let Some(l) = library() {
-        let mut l = l.state.lock().unwrap_or_else(|e| e.into_inner());
-        l.prebuilt_changed |= l.prebuilt.insert(key);
+    if let Some(libraries) = libraries() {
+        let mut shard = libraries[shard_of(&key)].state.lock().unwrap_or_else(|e| e.into_inner());
+        shard.prebuilt_changed |= shard.prebuilt.insert(key);
     }
 }
 
@@ -261,22 +347,37 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// (the others then find it in the library); different names overlap.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), true)));
-    let Some(library) = library() else {
+    let Some(libraries) = libraries() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
+    let library = &libraries[shard_of(name)];
     let _held = NAMES.hold(name);
     // Outside the lock: loads take up to seconds, and a save holds the lock
     // for as long as it serialises. The library's blob lives as long as it
     // does, which is never dropped.
     if let Ok(pso) = load(&library.loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
+        return Ok(pso);
+    }
+    // A cache from before the shards still has it: taken from there, and
+    // stored into the shard it belongs to now.
+    if let Some(old) = legacy()
+        && let Ok(pso) = load(&old.loads, PCWSTR(wide.as_ptr()))
+    {
+        LOADED.fetch_add(1, Ordering::Relaxed);
+        let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a live pipeline; a name already stored is refused, which
+        // leaves the library as it was.
+        if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+            l.added += 1;
+        }
         return Ok(pso);
     }
     // Compiled outside the lock: compiles take up to seconds.
@@ -301,12 +402,12 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Writes the shards that gained pipelines since the last save, and the
+/// early list if it changed, when `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let (Some(dir), Some(libraries)) = (DIR.get(), libraries()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -314,60 +415,79 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let (blob, prebuilt) = {
-        let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
-            return;
+    let _ = std::fs::create_dir_all(dir);
+    let early_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+    let mut files = 0;
+    let mut bytes = 0;
+    for (at, shared) in libraries.iter().enumerate() {
+        if !shared.state.lock().unwrap_or_else(|e| e.into_inner()).dirty() {
+            continue;
         }
-        // SAFETY: a plain size query on a live library.
-        let size = unsafe { l.library.GetSerializedSize() };
-        let Some(mut bytes) = zeroed(size) else {
-            // Left for a later save: the pipelines stay counted as added.
-            tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
-            return;
+        // Serialised under the lock (a store into the shard must not land in
+        // a blob that is already taken), written without it.
+        let Some((blob, prebuilt)) = serialise(shared) else {
+            continue;
         };
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe { l.library.Serialize(&mut bytes) }.map(|()| bytes);
-        match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
-                // Kept beside the bytes it holds for (also when a run adds
-                // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                return;
-            }
-        }
-    };
-    let used = used().as_ref().map(Used::list).unwrap_or_default();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
-        .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
+        let written = write_atomically(&dir.join(shard_file(at)), &blob).and_then(|()| match &prebuilt {
+            Some(list) => write_atomically(&dir.join(prebuilt_file(at)), list.as_bytes()),
             None => Ok(()),
         });
+        if let Err(e) = written {
+            // Left dirty: the next save writes it.
+            tracing::warn!(error = %e, shard = at, "a host pipeline library shard not saved");
+            continue;
+        }
+        {
+            let mut l = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            l.added = 0;
+            l.prebuilt_changed = false;
+        }
+        files += 1;
+        bytes += blob.len();
+    }
+    let used = used().as_ref().map(Used::list).unwrap_or_default();
+    if (early_changed || now)
+        && let Err(e) = write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes())
+    {
+        tracing::warn!(error = %e, "the early list not saved");
+    }
+    if files == 0 && !early_changed {
+        return;
+    }
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
-    match written {
-        Ok(()) => tracing::info!(
-            bytes = blob.len(),
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            created,
-            distinct,
-            shaders_cached,
-            shaders_translated,
-            "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+    tracing::info!(
+        files,
+        bytes,
+        early = used.len(),
+        made = MADE.load(Ordering::Relaxed),
+        loaded = LOADED.load(Ordering::Relaxed),
+        started_early = EARLY.load(Ordering::Relaxed),
+        created,
+        distinct,
+        shaders_cached,
+        shaders_translated,
+        "host pipeline library saved"
+    );
+}
+
+/// `shared`'s library as bytes with the pre-build's list for them: `None` if
+/// the host cannot serialise it now (it stays dirty for the next save).
+fn serialise(shared: &Shared) -> Option<(Vec<u8>, Option<String>)> {
+    let l = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: a plain size query on a live library.
+    let size = unsafe { l.library.GetSerializedSize() };
+    let Some(mut bytes) = zeroed(size) else {
+        tracing::warn!(bytes = size, "no memory to serialise a library shard; saved later");
+        return None;
+    };
+    // SAFETY: a buffer of the size the library asks for.
+    if let Err(e) = unsafe { l.library.Serialize(&mut bytes) } {
+        tracing::warn!(error = %e, "a host pipeline library shard not serialised");
+        return None;
     }
+    let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
+    Some((bytes, prebuilt))
 }
 
 /// `n` zero bytes, or `None` when the host has no memory for them. The
@@ -717,9 +837,10 @@ mod tests {
     fn a_pipeline_loads_while_a_save_holds_the_library() {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::core::s;
-        let (Some(device), Some(library)) = (
+        const NAME: &str = "test: a pipeline loads while a save holds the library";
+        let (Some(device), Some(libraries)) = (
             crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()),
-            library(),
+            libraries(),
         ) else {
             return; // no host GPU here
         };
@@ -782,7 +903,7 @@ mod tests {
                     ..Default::default()
                 };
                 pipeline(
-                    "test: a pipeline loads while a save holds the library",
+                    NAME,
                     // SAFETY: the description points at live data.
                     |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                     || match made {
@@ -795,7 +916,7 @@ mod tests {
         }
         let made = Made(device, root, code);
         made.get(true).expect("made and stored");
-        let saving = library.state.lock().unwrap_or_else(|e| e.into_inner());
+        let saving = libraries[shard_of(NAME)].state.lock().unwrap_or_else(|e| e.into_inner());
         let (done, loaded) = std::sync::mpsc::channel();
         std::thread::scope(|s| {
             let made = &made;
@@ -815,6 +936,21 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
+    }
+
+    /// A pipeline's shard is stable across runs and spread over all of them,
+    /// which is what makes a save write only what changed.
+    #[test]
+    fn names_spread_over_the_shards_and_keep_their_shard() {
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..10_000u32 {
+            let name = format!("{i:032x}");
+            let shard = shard_of(&name);
+            assert!(shard < SHARDS);
+            assert_eq!(shard, shard_of(&name), "the same name, the same shard");
+            seen.insert(shard);
+        }
+        assert_eq!(seen.len(), SHARDS, "every shard gets names");
     }
 
     #[test]
