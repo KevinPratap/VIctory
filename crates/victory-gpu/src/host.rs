@@ -1149,6 +1149,10 @@ enum Step {
     /// whether their program uses title memory (then the range is withheld
     /// when such a list misses, `crate::memory::withholding`).
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool, bool),
+    /// Shaders write ranges known only at submission, not marked: what finds
+    /// them, those found (taken once the list has run), and as the last of
+    /// `GpuWrite`.
+    GpuWrites(Box<dyn Fn() -> Vec<Range> + Send>, std::cell::RefCell<Vec<Range>>, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>),
@@ -1160,6 +1164,9 @@ enum Step {
     /// brought up to date.
     Memory(usize),
 }
+
+/// A range (address, bytes) of a buffer's host copy.
+pub(crate) type Range = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
 
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
@@ -1601,15 +1608,20 @@ impl Host {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
             for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len, _, memory) = step {
-                    let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
-                    // A range both kinds declare is withheld whole.
-                    let goes_back = !(missed && *memory);
+                let (ranges, memory) = match step {
+                    Step::GpuWrite(shadow, address, len, _, memory) => (vec![(shadow.clone(), *address, *len)], *memory),
+                    Step::GpuWrites(_, found, memory) => (found.take(), *memory),
+                    _ => continue,
+                };
+                // A range both kinds declare is withheld whole.
+                let goes_back = !(missed && memory);
+                for (shadow, address, len) in ranges {
+                    let key = (std::sync::Arc::as_ptr(&shadow) as usize, address, len);
                     match index.get(&key) {
                         Some(&i) => back[i].3 &= goes_back,
                         None => {
                             index.insert(key, back.len());
-                            back.push((shadow.clone(), *address, *len, goes_back));
+                            back.push((shadow, address, len, goes_back));
                         }
                     }
                 }
@@ -2374,6 +2386,15 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
     }
 
+    /// As [`HostList::defer_gpu_write`] (not marked), with the refreshes, of
+    /// the ranges `find` gives at submission.
+    pub(crate) fn defer_gpu_writes(&self, find: impl Fn() -> Vec<Range> + Send + 'static) {
+        let memory = self.memory_writer.load(Ordering::Relaxed);
+        self.deferred()
+            .copies
+            .push(Step::GpuWrites(Box::new(find), std::cell::RefCell::default(), memory));
+    }
+
     /// Shaders of the list take views from the heap itself
     /// (`crate::bindless`): what the heap's views reach is brought up to
     /// date at submission (once until a title copy intervenes).
@@ -2585,7 +2606,7 @@ impl HostList {
                     Step::Refresh(..) => C::StepRefreshUs,
                     Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
                     Step::Run(_) | Step::Host(_) => C::StepWorkUs,
-                    Step::GpuWrite(..) => C::StepGpuWriteUs,
+                    Step::GpuWrite(..) | Step::GpuWrites(..) => C::StepGpuWriteUs,
                     Step::Texture(..) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
                     Step::Memory(_) => C::StepMemoryUs,
@@ -2655,6 +2676,22 @@ impl HostList {
                         batch.flush();
                     }
                     shadow.writing(*address, *len, *marked);
+                    continue;
+                }
+                Step::GpuWrites(find, found, _) => {
+                    let ranges = find();
+                    if ranges.is_empty() {
+                        continue;
+                    }
+                    for (shadow, address, len) in &ranges {
+                        batch.add(shadow, *address, *len);
+                    }
+                    batch.flush();
+                    for (shadow, address, len) in &ranges {
+                        shadow.writing(*address, *len, false);
+                    }
+                    // A submission may name a list twice.
+                    found.borrow_mut().extend(ranges);
                     continue;
                 }
                 // Brought up to date before the submission's lists were made.
@@ -4530,6 +4567,7 @@ mod withholding {
     /// along.
     #[test]
     fn only_programs_using_title_memory_are_withheld() {
+        let _guard = crate::memory::tests::gpu_test_lock();
         use crate::watch::PAGE;
         let Some(host) = super::host() else {
             return; // no host GPU here
