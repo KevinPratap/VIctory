@@ -11,12 +11,15 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::mem::offset_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
 };
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
+
+const E_FAIL: HRESULT = 0x8000_4005_u32 as HRESULT;
 
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
@@ -111,6 +114,8 @@ struct List {
     /// tests +0x548, so its layout runs past 0x560. Its size is unknown;
     /// this keeps our fields clear of whatever the title writes there.
     newer: [u32; 256],
+    /// Guest recording state. Host lists also close when a wait cuts a segment.
+    recording: AtomicBool,
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
@@ -380,6 +385,7 @@ fn new_list(
         compute_root_headers: [0; 128],
         pipeline_shadow: [0; 8],
         newer: [0; 256],
+        recording: AtomicBool::new(true),
         uploads: Default::default(),
         #[cfg(windows)]
         hosts: std::sync::Mutex::new(
@@ -448,6 +454,11 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    if !list.recording.swap(false, Ordering::Relaxed) {
+        return E_FAIL;
+    }
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
@@ -458,15 +469,18 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // A queue may still hold what the list recorded (`restart`, `leave`).
     // SAFETY: the title passes one of our lists.
-    let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    let uploads = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
+    let list = unsafe { &*this.cast::<List>() };
+    if list.recording.swap(true, Ordering::Relaxed) {
+        return E_FAIL;
+    }
+
+    // A queue may still hold what the list recorded (`restart`, `leave`).
+    let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(windows)]
     {
         let held = restart(this);
-        // SAFETY: the title passes one of our lists.
-        let mut state = unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
         let old = std::mem::take(&mut *state);
         state.reset(pipeline);
         drop(state);
@@ -475,8 +489,6 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     #[cfg(not(windows))]
     drop(uploads);
     crate::pipeline::bound(pipeline);
-    #[cfg(not(windows))]
-    let _ = this;
     S_OK
 }
 
@@ -2052,6 +2064,43 @@ mod tests {
             }
         });
         assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn list_close_and_reset_follow_the_guest_recording_state() {
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Reset = extern "system" fn(This, This, This) -> HRESULT;
+        type Release = extern "system" fn(This) -> u32;
+
+        let null = std::ptr::null();
+        let mut results = Vec::new();
+        for kind in [0, 3] {
+            let mut allocator = null;
+            assert_eq!(
+                create_allocator(null, kind, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, kind, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            let close = slot::<Close>(list, 0x48);
+            let reset = slot::<Reset>(list, 0x50);
+            results.push([
+                reset(list, allocator, null),
+                close(list),
+                close(list),
+                reset(list, allocator, null),
+                reset(list, allocator, null),
+                close(list),
+            ]);
+            for object in [list, allocator] {
+                assert_eq!(slot::<Release>(object, 0x10)(object), 0);
+            }
+        }
+        let e_fail = 0x8000_4005_u32 as HRESULT;
+        assert_eq!(results, [[e_fail, S_OK, e_fail, S_OK, e_fail, S_OK]; 2]);
     }
 
     /// ClearUnorderedAccessViewUint/Float and DiscardResource come before
