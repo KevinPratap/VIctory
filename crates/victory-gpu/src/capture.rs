@@ -372,7 +372,7 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -397,12 +397,15 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
         let state = copy.state.load(Relaxed);
         let target = (i, *resource as crate::object::This, by.as_str());
         dump_one(host, texture, state, &format!("frame-{frame}-s{sub:04}"), target, &d);
+        if d.SampleDesc.Count > 1 {
+            continue;
+        }
         // A depth texture's writable twin (`crate::twin`): what unordered
         // views wrote, which reaches the depth texture at its next use.
         for (p, plane) in copy.twin.get().and_then(Option::as_ref).iter().flat_map(|t| t.planes.iter().enumerate()) {
@@ -538,6 +541,61 @@ pub(crate) fn read_indirect(
     }
 }
 
+/// A single-sampled copy target for a typed color format the host can resolve.
+fn resolve_destination(
+    device: &ID3D12Device,
+    source: &D3D12_RESOURCE_DESC,
+) -> Option<ID3D12Resource> {
+    if source.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || source.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0
+    {
+        return None;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: source.Format,
+        ..Default::default()
+    };
+    // SAFETY: the query has correctly typed writable storage.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            std::mem::size_of_val(&support) as u32,
+        )
+    }
+    .ok()?;
+    let required = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE.0;
+    if support.Support1.0 & required != required {
+        return None;
+    }
+
+    let desc = D3D12_RESOURCE_DESC {
+        Alignment: 0,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+        ..*source
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let mut target = None;
+    // SAFETY: a valid, single-sampled description and writable output.
+    unsafe {
+        device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_RESOLVE_DEST,
+            None,
+            &mut target,
+        )
+    }
+    .ok()?;
+    target
+}
+
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
@@ -546,19 +604,38 @@ fn dump_one(
     (i, resource, by): (usize, crate::object::This, &str),
     d: &D3D12_RESOURCE_DESC,
 ) {
+    let resolved = if d.SampleDesc.Count > 1 {
+        let Some(target) = resolve_destination(&host.device, d) else { return };
+        Some(target)
+    } else {
+        None
+    };
     let Ok(list) = host.new_list() else { return };
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    // SAFETY: an open list of ours and a live texture.
+    let source = if resolved.is_some() { D3D12_RESOURCE_STATE_RESOLVE_SOURCE } else { copy };
+    // SAFETY: an open list and live textures. The resolved texture is kept
+    // through execution, and the source goes back to its original state.
     let read = unsafe {
-        if state != copy {
+        if state != source {
             list.list
-                .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
+                .ResourceBarrier(&[crate::host::transition(texture, state, source)]);
         }
-        let read = read_back(&host.device, &list.list, texture);
-        if state != copy {
+        let read_texture = if let Some(target) = &resolved {
+            list.list.ResolveSubresource(target, 0, texture, 0, d.Format);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                target,
+                D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                copy,
+            )]);
+            target
+        } else {
+            texture
+        };
+        let read = read_back(&host.device, &list.list, read_texture);
+        if state != source {
             list.list
-                .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
+                .ResourceBarrier(&[crate::host::transition(texture, source, state)]);
         }
         read
     };
