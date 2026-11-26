@@ -296,6 +296,18 @@ pub extern "C" fn exit(code: i32) -> ! {
     host::exit(code)
 }
 
+/// The kernel's `ExitProcess`: logged as [`exit`] is, then the host's own
+/// with the title's code (it was bound to the host's, silently: a title
+/// that ended the process that way left no line saying so). Not the CRT's
+/// `exit`: that runs the exit table on the calling thread while the
+/// title's other threads live, where an exit function waiting for a lock
+/// one of them holds hangs; Windows ends the other threads first and runs
+/// no exit table of the program.
+pub extern "system" fn ExitProcess(code: u32) -> ! {
+    tracing::warn!(code, from = %host::callers(), "title ends the process");
+    host::exit_process(code)
+}
+
 /// The CRT's `abort` (also reached from `terminate`): logged like [`exit`].
 pub extern "C" fn abort() -> ! {
     tracing::error!(from = %host::callers(), "title aborts");
@@ -441,6 +453,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(OutputDebugStringA),
             hle_export!(OutputDebugStringW),
             hle_export!(exit),
+            hle_export!(ExitProcess),
             hle_export!(abort),
             hle_export!(terminate),
             hle_export!(_invalid_parameter_noinfo_noreturn),
@@ -564,6 +577,11 @@ mod host {
         unsafe { crt_abort() }
     }
 
+    pub(super) fn exit_process(code: u32) -> ! {
+        // SAFETY: ends this process with the title's code.
+        unsafe { windows_sys::Win32::System::Threading::ExitProcess(code) }
+    }
+
     pub(super) fn terminate_process(process: *mut c_void, code: u32) -> i32 {
         // SAFETY: see above.
         unsafe { TerminateProcess(process, code) }
@@ -668,6 +686,10 @@ mod host {
         std::process::abort()
     }
 
+    pub(super) fn exit_process(code: u32) -> ! {
+        std::process::exit(code as i32)
+    }
+
     pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
         std::process::exit(code as i32)
     }
@@ -686,6 +708,62 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title's `ExitProcess` ends the process as Windows does, with the
+    /// title's code: the CRT's exit table does not run on the calling
+    /// thread while another thread lives (an exit function that wants a
+    /// lock the caller holds would hang there). A child process of this
+    /// test binary makes the call; the test waits for it at most 30 s.
+    #[cfg(windows)]
+    #[test]
+    fn a_title_exit_process_ends_as_windows_does_with_its_code() {
+        const CHILD: &str = "VICTORY_TEST_EXIT_PROCESS_CHILD";
+        const CODE: u32 = 0x8765_4321;
+        if std::env::var_os(CHILD).is_some() {
+            static HELD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            extern "C" fn wants_the_lock() {
+                drop(HELD.lock());
+            }
+            unsafe extern "C" {
+                fn atexit(f: extern "C" fn()) -> i32;
+            }
+            let _held = HELD.lock().unwrap();
+            // SAFETY: registers a function with the CRT's exit table.
+            assert_eq!(unsafe { atexit(wants_the_lock) }, 0);
+            // Another thread alive, as the title's are.
+            drop(std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }));
+            ExitProcess(CODE);
+        }
+        let test =
+            "modules::kernel::tests::a_title_exit_process_ends_as_windows_does_with_its_code";
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                let _ = child.kill();
+                panic!("the title's ExitProcess did not end the process in 30 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(
+            status.code().map(|c| c as u32),
+            Some(CODE),
+            "the title's code"
+        );
+    }
 
     #[test]
     fn disable_thread_library_calls_accepts_pseudo_modules() {
