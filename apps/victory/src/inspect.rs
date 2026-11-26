@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use victory_pe::implib::ImportLibrary;
-use victory_pe::{ImageInfo, layout};
+use victory_pe::implib::{ImportLibrary, LibImport, LibImportKind};
+use victory_pe::{ImageInfo, ImportSymbol, layout};
 
 pub fn run(file: &Path, list_imports: bool, list_exports: bool) -> Result<()> {
     let data = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
@@ -104,28 +104,35 @@ pub fn lib_exports(lib: &Path, list: bool) -> Result<()> {
     let data = std::fs::read(lib).with_context(|| format!("reading {}", lib.display()))?;
     let parsed =
         ImportLibrary::parse(&data).with_context(|| format!("parsing {}", lib.display()))?;
-    let mut by_dll: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for i in &parsed.imports {
-        by_dll
-            .entry(i.dll.to_ascii_lowercase())
-            .or_default()
-            .push(i.export.to_string());
-    }
+    let by_dll = group_lib_exports(&parsed.imports);
+    let export_count: usize = by_dll.values().map(BTreeSet::len).sum();
     println!(
-        "{} exports from {} DLLs ({} other members)",
-        parsed.imports.len(),
+        "{export_count} exports from {} DLLs ({} other members)",
         by_dll.len(),
         parsed.other_members
     );
-    for (dll, names) in &by_dll {
-        println!("{dll:<60} {:>5}", names.len());
+    for (dll, exports) in &by_dll {
+        println!("{dll:<60} {:>5}", exports.len());
         if list {
-            for n in names {
-                println!("    {n}");
+            for (export, _) in exports {
+                println!("    {export}");
             }
         }
     }
     Ok(())
+}
+
+fn group_lib_exports(
+    imports: &[LibImport],
+) -> BTreeMap<String, BTreeSet<(&ImportSymbol, LibImportKind)>> {
+    let mut by_dll: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    for import in imports {
+        by_dll
+            .entry(import.dll.to_ascii_lowercase())
+            .or_default()
+            .insert((&import.export, import.kind));
+    }
+    by_dll
 }
 
 fn yes(b: bool) -> &'static str {
@@ -204,6 +211,68 @@ fn section_flags(v: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn import_archive(members: &[(&str, &str, u16)]) -> Vec<u8> {
+        let mut archive = b"!<arch>\n".to_vec();
+        for &(dll, name, kind) in members {
+            let strings = format!("{name}\0{dll}\0");
+            let size = 20 + strings.len();
+            let header = format!("{:<16}{:<32}{size:<10}`\n", "import.obj/", "");
+            archive.extend_from_slice(header.as_bytes());
+            archive.extend_from_slice(b"\0\0\xff\xff\0\0"); // Signatures and version
+            archive.extend_from_slice(&victory_pe::MACHINE_AMD64.to_le_bytes());
+            archive.extend_from_slice(&0u32.to_le_bytes()); // Timestamp
+            archive.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+            archive.extend_from_slice(&0u16.to_le_bytes()); // Hint
+            archive.extend_from_slice(&(kind | (1 << 2)).to_le_bytes()); // Import by name
+            archive.extend_from_slice(strings.as_bytes());
+            if size % 2 == 1 {
+                archive.push(b'\n');
+            }
+        }
+        archive
+    }
+
+    #[test]
+    fn lib_exports_deduplicates_dll_names_with_different_case() {
+        let archive = import_archive(&[("Example.dll", "Foo", 0), ("example.dll", "Foo", 0)]);
+        let parsed = ImportLibrary::parse(&archive).unwrap();
+        assert_eq!(parsed.imports.len(), 2);
+
+        let by_dll = group_lib_exports(&parsed.imports);
+        assert_eq!(by_dll.len(), 1);
+        let exports = &by_dll["example.dll"];
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports.first().unwrap().0.to_string(), "Foo");
+    }
+
+    #[test]
+    fn lib_exports_preserves_distinct_symbols_kinds_and_dlls() {
+        use LibImportKind::{Code, Data};
+
+        let archive = import_archive(&[
+            ("Example.dll", "Foo", 0),
+            ("example.dll", "Bar", 0),
+            ("example.dll", "Foo", 1),
+            ("Other.dll", "Foo", 0),
+        ]);
+        let parsed = ImportLibrary::parse(&archive).unwrap();
+        let by_dll = group_lib_exports(&parsed.imports);
+        let exports: Vec<_> = by_dll["example.dll"]
+            .iter()
+            .map(|(export, kind)| (export.to_string(), *kind))
+            .collect();
+        assert_eq!(
+            exports,
+            [
+                ("Bar".to_owned(), Code),
+                ("Foo".to_owned(), Code),
+                ("Foo".to_owned(), Data),
+            ]
+        );
+        assert_eq!(by_dll.len(), 2);
+        assert_eq!(by_dll["other.dll"].len(), 1);
+    }
 
     #[test]
     fn section_flags_names_the_title_sections() {
