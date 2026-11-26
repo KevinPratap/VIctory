@@ -84,12 +84,32 @@ impl Named {
             e.blends.iter().for_each(|b| named.try_blend(&mut want, b));
         }
         named.finding = "registers";
-        named.name_from_registers(&mut want, pack);
+        if !want.depth.is_empty() || !want.blend.is_empty() {
+            named.name_from_registers(&mut want, pack);
+        }
         // Rasterisers have no register image here; depth states some
         // registers do not keep.
         named.finding = "enumeration";
-        depth_space(|b| named.try_depth(&mut want, &b));
-        raster_space(|b| named.try_raster(&mut want, &b));
+        if !want.depth.is_empty() {
+            let _ = depth_space(|b| {
+                named.try_depth(&mut want, &b);
+                if want.depth.is_empty() {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            });
+        }
+        if !want.raster.is_empty() {
+            let _ = raster_space(|b| {
+                named.try_raster(&mut want, &b);
+                if want.raster.is_empty() {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            });
+        }
         named
     }
 
@@ -111,6 +131,9 @@ impl Named {
     fn name_from_registers(&mut self, want: &mut Wanted, pack: &Pack) {
         let mut tried = HashSet::new();
         for g in pack.graphics() {
+            if want.depth.is_empty() && want.blend.is_empty() {
+                break;
+            }
             let (Some(regs), Some(formats)) = (registers(g.packet), g.target_formats()) else {
                 continue;
             };
@@ -118,10 +141,26 @@ impl Named {
                 continue;
             }
             if want.depth.contains(&g.depth_stencil_hash) {
-                depth_from_registers(&regs, |b| self.try_depth(want, &b));
+                let target = g.depth_stencil_hash;
+                let _ = depth_from_registers(&regs, |b| {
+                    self.try_depth(want, &b);
+                    if want.depth.contains(&target) {
+                        std::ops::ControlFlow::Continue(())
+                    } else {
+                        std::ops::ControlFlow::Break(())
+                    }
+                });
             }
             if want.blend.contains(&g.blend_hash) {
-                blend_from_registers(&regs, &formats, |b| self.try_blend(want, &b));
+                let target = g.blend_hash;
+                let _ = blend_from_registers(&regs, &formats, |b| {
+                    self.try_blend(want, &b);
+                    if want.blend.contains(&target) {
+                        std::ops::ControlFlow::Continue(())
+                    } else {
+                        std::ops::ControlFlow::Break(())
+                    }
+                });
             }
         }
     }
@@ -146,9 +185,15 @@ const SLOPES: [f32; 29] = [
     -1.0, -1.5, -2.0, -4.0, 0.75, 1.25, 6.0, 7.0, 20.0, 32.0, 64.0, 100.0,
 ];
 
-fn raster_space(mut f: impl FnMut([u8; RASTER])) {
-    let mut biases: Vec<i8> = (-16..=16).collect();
-    biases.extend([-128, 127, 100, -100, 50, -50, 64, -64, 32, -32]);
+/// Integer depth biases tried in [`raster_space`].
+const BIASES: [i8; 43] = [
+    -16, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7,
+    8, 9, 10, 11, 12, 13, 14, 15, 16, -128, 127, 100, -100, 50, -50, 64, -64, 32, -32,
+];
+
+fn raster_space(
+    mut f: impl FnMut([u8; RASTER]) -> std::ops::ControlFlow<()>,
+) -> std::ops::ControlFlow<()> {
     for fill in [2, 3] {
         for cull in [1, 2, 3] {
             for ccw in [0, 1] {
@@ -158,21 +203,22 @@ fn raster_space(mut f: impl FnMut([u8; RASTER])) {
                     let mut b = [0u8; RASTER];
                     b[..3].copy_from_slice(&[fill, cull, ccw]);
                     b[12..].copy_from_slice(&tail);
-                    f(b);
-                    for &bias in &biases {
+                    f(b)?;
+                    for bias in BIASES {
                         for slope in SLOPES {
                             if bias == 0 && slope == 0.0 {
                                 continue;
                             }
                             b[3] = bias as u8;
                             b[8..12].copy_from_slice(&slope.to_le_bytes());
-                            f(b);
+                            f(b)?;
                         }
                     }
                 }
             }
         }
     }
+    std::ops::ControlFlow::Continue(())
 }
 
 /// Stencil masks tried.
@@ -181,7 +227,9 @@ const MASKS: [u8; 19] = [
     0x00, 0x7F, 0xFE,
 ];
 
-fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
+fn depth_space(
+    mut f: impl FnMut([u8; DEPTH]) -> std::ops::ControlFlow<()>,
+) -> std::ops::ControlFlow<()> {
     for enable in [0, 1] {
         for write in [0, 1] {
             for func in 1..=8 {
@@ -191,7 +239,7 @@ fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
                         enable, write, func, 0, 0xFF, 0xFF, 1, 1, 1, 8, 1, 1, 1, 8,
                     ]);
                     b[22..].copy_from_slice(&tail);
-                    f(b);
+                    f(b)?;
                 }
                 // Stencil on, the same ops on both faces.
                 for read in MASKS {
@@ -204,7 +252,7 @@ fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
                                 b[6..10].copy_from_slice(&face);
                                 b[10..14].copy_from_slice(&face);
                                 b[22..].copy_from_slice(&[1, 1]);
-                                f(b);
+                                f(b)?;
                             }
                         }
                     }
@@ -212,6 +260,7 @@ fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
             }
         }
     }
+    std::ops::ControlFlow::Continue(())
 }
 
 /// The depth, stencil and blend registers of a pack record's register
@@ -250,7 +299,10 @@ fn stencil_op(v: u32) -> u8 {
     }
 }
 
-fn depth_from_registers(regs: &[u32; 14], mut f: impl FnMut([u8; DEPTH])) {
+fn depth_from_registers(
+    regs: &[u32; 14],
+    mut f: impl FnMut([u8; DEPTH]) -> std::ops::ControlFlow<()>,
+) -> std::ops::ControlFlow<()> {
     let [control, stencil, mask, ..] = *regs;
     let stencil_on = (control & 1) as u8;
     let depth_on = control >> 1 & 1 != 0;
@@ -276,35 +328,35 @@ fn depth_from_registers(regs: &[u32; 14], mut f: impl FnMut([u8; DEPTH])) {
     } else {
         (off, off, (0xFF, 0xFF))
     };
-    let (enables, writes, funcs): (&[u8], &[u8], Vec<u8>) = if depth_on {
-        (&[1], &[(control >> 2 & 1) as u8], vec![func(control >> 4)])
+    let single_func = [func(control >> 4)];
+    let all_funcs = [1, 2, 3, 4, 5, 6, 7, 8];
+    let (enables, writes, funcs): (&[u8], &[u8], &[u8]) = if depth_on {
+        (&[1], &[(control >> 2 & 1) as u8], &single_func)
     } else {
-        (&[0, 1], &[0, 1], (1..=8).collect())
+        (&[0, 1], &[0, 1], &all_funcs)
     };
-    let mut faces = vec![(front, back)];
-    if stencil_on != 0 {
-        // The second face when back-face stencil is off.
-        faces.push((front, off));
-    }
+    let faces = [(front, back), (front, off)];
+    let face_count = if stencil_on != 0 { 2 } else { 1 };
     for &e in enables {
         for &w in writes {
-            for &fun in &funcs {
-                for &(front, back) in &faces {
+            for &fun in funcs {
+                for &(front, back) in &faces[..face_count] {
                     let mut b = [0u8; DEPTH];
                     b[..6].copy_from_slice(&[e, w, fun, stencil_on, masks.0 as u8, masks.1 as u8]);
                     b[6..10].copy_from_slice(&front);
                     b[10..14].copy_from_slice(&back);
                     b[22..].copy_from_slice(&[1, 1]);
-                    f(b);
+                    f(b)?;
                     if stencil_on == 0 {
                         b[4] = (mask >> 8) as u8;
                         b[5] = (mask >> 16) as u8;
-                        f(b);
+                        f(b)?;
                     }
                 }
             }
         }
     }
+    std::ops::ControlFlow::Continue(())
 }
 
 /// Hardware blend factors to D3D12's.
@@ -357,52 +409,57 @@ fn blend_target(control: u32, mask: u8) -> Vec<[u8; 8]> {
         return Vec::new();
     };
     // D3D12 names the alpha slots' colour factors as their alpha twins.
-    let twins = |f: u8| {
-        let alias = [(3, 5), (4, 6), (9, 7), (10, 8), (16, 18), (17, 19)];
-        std::iter::once(f)
-            .chain(alias.iter().filter(|a| a.1 == f).map(|a| a.0))
-            .collect::<Vec<u8>>()
+    let twins = |f: u8| -> ([u8; 2], usize) {
+        const ALIAS: [(u8, u8); 6] = [(3, 5), (4, 6), (9, 7), (10, 8), (16, 18), (17, 19)];
+        match ALIAS.iter().find(|a| a.1 == f) {
+            Some(&(a, _)) => ([f, a], 2),
+            None => ([f, 0], 1),
+        }
     };
-    let mut out = Vec::new();
-    for sa in twins(sa) {
-        for &da in &twins(da) {
+    let (sa_twins, sa_len) = twins(sa);
+    let (da_twins, da_len) = twins(da);
+    let mut out = Vec::with_capacity(sa_len * da_len);
+    for &sa in &sa_twins[..sa_len] {
+        for &da in &da_twins[..da_len] {
             out.push([1, s, d, op, sa, da, opa, mask]);
         }
     }
     out
 }
 
-fn blend_from_registers(regs: &[u32; 14], formats: &[u8; 8], mut f: impl FnMut([u8; BLEND])) {
+fn blend_from_registers(
+    regs: &[u32; 14],
+    formats: &[u8; 8],
+    mut f: impl FnMut([u8; BLEND]) -> std::ops::ControlFlow<()>,
+) -> std::ops::ControlFlow<()> {
     let target_mask = regs[5];
-    let per_target: Vec<Vec<[u8; 8]>> = (0..8)
-        .map(|i| {
-            let control = regs[6 + i];
-            let m = (target_mask >> (4 * i) & 15) as u8;
-            let mut masks = vec![m];
-            if formats[i] == 0 {
-                masks.extend([0, 15]);
-                if i > 0 {
-                    masks.push((target_mask & 15) as u8);
-                }
-                masks.sort_unstable();
-                masks.dedup();
+    let per_target: [Vec<[u8; 8]>; 8] = std::array::from_fn(|i| {
+        let control = regs[6 + i];
+        let m = (target_mask >> (4 * i) & 15) as u8;
+        let mut masks = vec![m];
+        if formats[i] == 0 {
+            masks.extend([0, 15]);
+            if i > 0 {
+                masks.push((target_mask & 15) as u8);
             }
-            let mut c: Vec<[u8; 8]> = masks
-                .iter()
-                .flat_map(|&m| blend_target(control, m))
-                .collect();
-            if formats[i] == 0 {
-                let mut cleared = DEFAULT_TARGET;
-                cleared[7] = 0;
-                c.extend([DEFAULT_TARGET, cleared]);
-            }
-            c
-        })
-        .collect();
+            masks.sort_unstable();
+            masks.dedup();
+        }
+        let mut c: Vec<[u8; 8]> = masks
+            .iter()
+            .flat_map(|&m| blend_target(control, m))
+            .collect();
+        if formats[i] == 0 {
+            let mut cleared = DEFAULT_TARGET;
+            cleared[7] = 0;
+            c.extend([DEFAULT_TARGET, cleared]);
+        }
+        c
+    });
     if per_target.iter().any(Vec::is_empty) {
-        return;
+        return std::ops::ControlFlow::Continue(());
     }
-    let build = |head: [u8; 4], targets: &[[u8; 8]]| {
+    let build = |head: [u8; 4], targets: &[[u8; 8]; 8]| {
         let mut b = [0u8; BLEND];
         b[..4].copy_from_slice(&head);
         for (i, t) in targets.iter().enumerate() {
@@ -418,10 +475,11 @@ fn blend_from_registers(regs: &[u32; 14], formats: &[u8; 8], mut f: impl FnMut([
                 // have no format (whose registers repeat another target's)
                 // left at D3D12's default, writing nothing up to some target
                 // and everything from there; then one target changed.
-                let first: Vec<[u8; 8]> = per_target.iter().map(|c| c[0]).collect();
-                let mut bases = vec![first.clone()];
+                let first: [[u8; 8]; 8] = std::array::from_fn(|i| per_target[i][0]);
+                let mut bases = Vec::with_capacity(10);
+                bases.push(first);
                 for split in 0..=8 {
-                    let mut base = first.clone();
+                    let mut base = first;
                     for (i, t) in base
                         .iter_mut()
                         .enumerate()
@@ -430,21 +488,23 @@ fn blend_from_registers(regs: &[u32; 14], formats: &[u8; 8], mut f: impl FnMut([
                         *t = DEFAULT_TARGET;
                         t[7] = if i < split { 0 } else { 15 };
                     }
-                    bases.push(base);
+                    if !bases.contains(&base) {
+                        bases.push(base);
+                    }
                 }
                 for base in &bases {
-                    f(build(head, base));
+                    f(build(head, base))?;
                     for (i, c) in per_target.iter().enumerate() {
+                        let mut targets = *base;
                         for &t in c {
-                            let mut targets = base.clone();
                             targets[i] = t;
-                            f(build(head, &targets));
+                            f(build(head, &targets))?;
                         }
                     }
                 }
             } else {
                 for &c0 in &per_target[0] {
-                    f(build(head, &[c0; 8]));
+                    f(build(head, &[c0; 8]))?;
                     let mut keep_off = c0;
                     keep_off[7] = 0;
                     let mut default_off = DEFAULT_TARGET;
@@ -455,16 +515,17 @@ fn blend_from_registers(regs: &[u32; 14], formats: &[u8; 8], mut f: impl FnMut([
                     let mut disabled = c0;
                     disabled[0] = 0;
                     for fill in [DEFAULT_TARGET, keep_off, default_off, [0; 8], off, disabled] {
+                        let mut targets = [fill; 8];
                         for n in 1..8 {
-                            let targets: Vec<[u8; 8]> =
-                                (0..8).map(|i| if i < n { c0 } else { fill }).collect();
-                            f(build(head, &targets));
+                            targets[n - 1] = c0;
+                            f(build(head, &targets))?;
                         }
                     }
                 }
             }
         }
     }
+    std::ops::ControlFlow::Continue(())
 }
 
 /// The engine's D3D12 depth-stencil description (the form with the
@@ -736,9 +797,29 @@ mod tests {
 
     #[test]
     fn the_depth_space_holds_the_d3d12_default() {
-        let mut found = false;
-        depth_space(|b| found |= b[..6] == [1, 1, 2, 0, 0xFF, 0xFF] && b[22..] == [1, 1]);
-        assert!(found);
+        let mut visited = 0usize;
+        let flow = depth_space(|b| {
+            visited += 1;
+            if b[..6] == [1, 1, 2, 0, 0xFF, 0xFF] && b[22..] == [1, 1] {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        assert!(flow.is_break());
+        // Short-circuits once found instead of walking all ~2.5M states.
+        assert!(visited < 2_000_000);
+    }
+
+    #[test]
+    fn raster_space_short_circuits_on_break() {
+        let mut visited = 0usize;
+        let flow = raster_space(|_| {
+            visited += 1;
+            std::ops::ControlFlow::Break(())
+        });
+        assert!(flow.is_break());
+        assert_eq!(visited, 1);
     }
 
     /// A record's metadata: targets 28 and 10, depth format 40, topology
@@ -861,9 +942,14 @@ mod tests {
             }
             b
         };
-        let mut found = false;
-        blend_from_registers(&regs, &[28, 0, 0, 0, 0, 0, 0, 0], |b| found |= b == want);
-        assert!(found);
+        let flow = blend_from_registers(&regs, &[28, 0, 0, 0, 0, 0, 0, 0], |b| {
+            if b == want {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        assert!(flow.is_break());
     }
 
     #[test]
@@ -883,8 +969,13 @@ mod tests {
                 want[11 + 8 * i] = 0;
             }
         }
-        let mut found = false;
-        blend_from_registers(&regs, &[28, 0, 0, 0, 0, 0, 0, 0], |b| found |= b == want);
-        assert!(found);
+        let flow = blend_from_registers(&regs, &[28, 0, 0, 0, 0, 0, 0, 0], |b| {
+            if b == want {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        assert!(flow.is_break());
     }
 }
