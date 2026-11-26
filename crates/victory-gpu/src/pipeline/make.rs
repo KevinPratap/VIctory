@@ -397,12 +397,34 @@ fn queue_index(p: &Pending, now: bool) -> usize {
     }
 }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Bounds the default worker count by installed physical memory so concurrent
+/// shader translations and driver compiles do not exhaust RAM/commit on 16 GiB
+/// hosts, while keeping the existing 2..=8 scaling on 32+ GiB hosts.
+fn default_workers(cores: usize, total_phys: Option<u64>) -> usize {
+    let cap = match total_phys {
+        Some(bytes) if bytes <= 18 << 30 => 2,
+        Some(bytes) if bytes <= 26 << 30 => 4,
+        _ => 8,
+    };
+    (cores / 2).clamp(2, cap)
+}
+
+fn total_physical_memory() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: `MEMORYSTATUSEX` is a plain C struct; `dwLength` is set to its size before the query.
+    let mut mem: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `mem` is valid and `dwLength` matches `size_of::<MEMORYSTATUSEX>()`.
+    (unsafe { GlobalMemoryStatusEx(&mut mem) } != 0).then_some(mem.ullTotalPhys)
+}
+
+/// Hands `p` to the workers (half the logical processors, 2 to 8, capped on
+/// lower-RAM hosts), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let n = default_workers(cores, total_physical_memory());
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
@@ -733,5 +755,33 @@ mod tests {
         assert!(matches!(cold.made.get(), Some(None)));
         assert!(matches!(warm.made.get(), Some(None)));
         assert!(shader.translated.get().is_none());
+    }
+
+    #[test]
+    fn default_workers_scales_with_physical_memory() {
+        const GIB: u64 = 1 << 30;
+        for ram in [8 * GIB, 16 * GIB, 18 * GIB] {
+            for cores in [1, 2, 4, 8, 16, 32] {
+                assert_eq!(default_workers(cores, Some(ram)), 2, "ram={ram} cores={cores}");
+            }
+        }
+        assert_eq!(default_workers(2, Some(24 * GIB)), 2);
+        assert_eq!(default_workers(4, Some(24 * GIB)), 2);
+        assert_eq!(default_workers(8, Some(24 * GIB)), 4);
+        assert_eq!(default_workers(16, Some(24 * GIB)), 4);
+        for ram in [Some(32 * GIB), Some(64 * GIB), None] {
+            assert_eq!(default_workers(1, ram), 2);
+            assert_eq!(default_workers(4, ram), 2);
+            assert_eq!(default_workers(8, ram), 4);
+            assert_eq!(default_workers(12, ram), 6);
+            assert_eq!(default_workers(16, ram), 8);
+            assert_eq!(default_workers(32, ram), 8);
+        }
+    }
+
+    #[test]
+    fn total_physical_memory_reports_nonzero_ram() {
+        let total = total_physical_memory().expect("GlobalMemoryStatusEx");
+        assert!(total > 0);
     }
 }
