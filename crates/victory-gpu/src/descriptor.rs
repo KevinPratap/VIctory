@@ -158,6 +158,60 @@ fn mirror(handle: u64) {
     }
 }
 
+#[cfg(windows)]
+fn sync_heap(heap: &Heap) {
+    let (Some(Some(host)), Some(written), Some(step)) =
+        (heap.host.get(), &heap.written, increment(heap.desc.kind))
+    else {
+        return;
+    };
+    let start = heap.start;
+    let step = u64::from(step);
+    let count = u64::from(heap.desc.count);
+    for (from, to) in written.take(start as usize, usize::MAX) {
+        // Probe at OS page (4 KiB) granularity: `watch::PAGE` is 64 KiB,
+        // while mappings and commits change per 4 KiB page. Probing only
+        // the start of a 64 KiB block both faults on an unmapped tail and
+        // skips mapped pages after an unmapped leading page.
+        const OS_PAGE: usize = 4 << 10;
+        for base in (from & !(OS_PAGE - 1)..to).step_by(OS_PAGE) {
+            let page_end = base.saturating_add(OS_PAGE);
+            let (page, end) = (base.max(from), page_end.min(to));
+            if !crate::host::read_into(page as *const u8, &mut [0u8; 1]) {
+                continue;
+            }
+            let mut first = (page as u64 - start) / step;
+            let mut last = (end as u64 - start).div_ceil(step).min(count);
+            // A descriptor only straddles an OS page boundary if the heap
+            // start is not aligned to `step` (16 or 32 bytes). Check the at
+            // most two edge slots before handing the interior to `sync_slots`.
+            let straddling = |index: u64| -> bool {
+                let handle = start + index * step;
+                if handle >= base as u64 && handle + 12 <= page_end as u64 {
+                    return false;
+                }
+                if crate::host::read_into(handle as *const u8, &mut [0u8; 12]) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::SyncSlots, 1);
+                    host.mirror(index as u32, handle, false);
+                }
+                true
+            };
+            if first < last && straddling(first) {
+                first += 1;
+            }
+            if first < last && straddling(last - 1) {
+                last -= 1;
+            }
+            if first < last {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::SyncSlots, last - first);
+                host.sync_slots(first as u32, last as u32, start, step);
+            }
+        }
+    }
+}
+
 /// Mirrors what the title wrote into its shader-visible heaps without a
 /// call: Grand Theft Auto VI copies descriptors (our records) into its heap
 /// as bytes, so only a change of its memory shows them. Each slot of a page
@@ -169,33 +223,9 @@ fn mirror(handle: u64) {
 pub(crate) fn sync_heaps() {
     // Held throughout: a heap is not dropped while its slots are made.
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    for &(start, _, at) in heaps.iter() {
+    for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
-        let heap = unsafe { &*(at as *const Heap) };
-        let (Some(Some(host)), Some(written), Some(step)) =
-            (heap.host.get(), &heap.written, increment(heap.desc.kind))
-        else {
-            continue;
-        };
-        let step = u64::from(step);
-        for (from, to) in written.take(start as usize, usize::MAX) {
-            // By page: one with nothing mapped (the title unmaps heap pages
-            // too) holds no records.
-            let page_size = crate::watch::PAGE;
-            for page in (from & !(page_size - 1)..to).step_by(page_size) {
-                let (page, end) = (page.max(from), (page + page_size).min(to));
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
-                    continue;
-                }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    crate::copystat::C::SyncSlots,
-                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
-                );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
-            }
-        }
+        sync_heap(unsafe { &*(at as *const Heap) });
     }
 }
 
@@ -1215,6 +1245,84 @@ pub(crate) mod tests {
             assert!(!host.made(5));
             sync_heaps();
             assert!(host.made(5), "made at the sync");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+    }
+
+    /// Within a 64 KiB watched block, `sync_heaps` probes each 4 KiB OS page:
+    /// it neither faults when trailing 4 KiB pages are decommitted nor skips
+    /// committed later 4 KiB pages when the leading 4 KiB page is decommitted.
+    #[cfg(windows)]
+    #[test]
+    fn sync_heaps_handles_partially_committed_64k_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const OS_PAGE: usize = 4 << 10;
+        let memory = crate::watch::tests::pool(1);
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: (2 * OS_PAGE / 16) as u32,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        let placement = Placement {
+            address: memory as u64,
+            size: (2 * OS_PAGE) as u64,
+        };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut elsewhere = [0u64; 2];
+            let at = elsewhere.as_mut_ptr() as u64;
+            create_sampler(
+                std::ptr::null(),
+                &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0],
+                at,
+            );
+            // Serialize against concurrent `sync_heaps()` from parallel tests
+            // while this test decommits/recommits sub-pages of its pool.
+            let _heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Case 1: first 4 KiB page committed, second 4 KiB page decommitted.
+            // Must mirror slot 5 without faulting on the decommitted second page.
+            assert!(!host.made(5));
+            let slot0 = memory as u64 + 5 * 16;
+            // SAFETY: 16 bytes inside the committed first 4 KiB page of our pool.
+            unsafe { std::ptr::copy_nonoverlapping(at as *const u8, slot0 as *mut u8, 16) };
+            // SAFETY: second 4 KiB page inside our test pool.
+            let freed = unsafe { VirtualFree((memory + OS_PAGE) as *mut _, OS_PAGE, MEM_DECOMMIT) };
+            assert_ne!(freed, 0);
+            sync_heap(heap(h));
+            assert!(host.made(5), "committed first 4 KiB page mirrored");
+
+            // Case 2: first 4 KiB page decommitted, second 4 KiB page committed.
+            // Must not skip the second 4 KiB page when the first is unreadable.
+            // SAFETY: re-committing the second 4 KiB page inside our test pool.
+            let recommitted = unsafe {
+                VirtualAlloc(
+                    (memory + OS_PAGE) as *const _,
+                    OS_PAGE,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!recommitted.is_null());
+            let slot_in_page1 = (OS_PAGE / 16 + 5) as u32;
+            assert!(!host.made(slot_in_page1));
+            let slot1 = memory as u64 + u64::from(slot_in_page1) * 16;
+            // SAFETY: 16 bytes inside the committed second 4 KiB page of our pool.
+            unsafe { std::ptr::copy_nonoverlapping(at as *const u8, slot1 as *mut u8, 16) };
+            // SAFETY: first 4 KiB page inside our test pool.
+            let freed = unsafe { VirtualFree(memory as *mut _, OS_PAGE, MEM_DECOMMIT) };
+            assert_ne!(freed, 0);
+            crate::watch::title_memory_remapped(memory, 2 * OS_PAGE);
+            sync_heap(heap(h));
+            assert!(
+                host.made(slot_in_page1),
+                "committed second 4 KiB page mirrored after leading 4 KiB decommit"
+            );
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         crate::watch::tests::free(memory);
