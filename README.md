@@ -271,6 +271,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | any build: translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); a real loop longer than `n` is cut short too, so 32 is a diagnostic value, 256-1024 a safer probe; if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
+| `VICTORY_AUDIO_CAPTURE_OF=<pid>` | the PID passed to the audio-recorder child when `VICTORY_AUDIO_CAPTURE` is set (internal plumbing) |
+| `VICTORY_TRAP_LOG=<file>` | crash-log path set by the trap-child test for an unimplemented import that traps |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
