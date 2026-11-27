@@ -25,6 +25,8 @@ The Forge is not a fork of the project and does not replace review. Pull request
 | Result | Meaning | What the author can do |
 |---|---|---|
 | in forge | Merged into `forge/main`, and the workspace builds with it. | Nothing. |
+| already in main | Merging the proposed head leaves the tree identical to `main`. | Confirm there is no remaining work, then close the PR. |
+| head changed | The author's branch changed while the report was being prepared. | Use the next report for the new head. |
 | conflicts with main | Does not merge with current `main` on its own. | Rebase onto `main`. |
 | conflicts with pull requests | Merges with `main`, but not after the pull requests listed in *with*. These changed the same files first. | Look at those pull requests: often one of them already does the same, or the two need to agree. |
 | breaks the build | Merges, but `cargo check --workspace --all-targets` or the repository's asset policy (`cargo xtask policy`) fails with it (first error shown). Often the pull request is older than an API change on `main`. | Rebase and build; remove files the policy refuses. |
@@ -56,6 +58,26 @@ python -I forge.py --repo ../VIctory-forge --out <folder outside the repo>
 ```
 
 Use a worktree of its own: the tool resets it. With `--limit 25` it tries only the first 25 pull requests.
+
+## Triage and conflicts
+
+Use `--triage-only` with the same command to write the report without checking out a branch or running builds. Reruns refresh `main` and fetch only PR heads that changed. The report lists PRs already incorporated in `main` and potential overlaps based on the merge result, linked issues, or titles and changed files. The JSON includes the reported PR head and both sides of each conflict.
+
+To work on a reported conflict, fetch the PR branch and the reported merge target into your clone. A conflict with `main` uses the report's `base` commit. For a conflict with other PRs, fetch `forge/main` from the Forge fork. Use that worktree to test integration and apply the relevant fix separately on the PR branch. If Forge discarded the target during a failed build, use the listed PRs and files to reproduce the conflict locally.
+
+```
+python -I triage.py resolve --repo ../VIctory --status /path/to/status.json --pr 123 --worktree ../resolve-123
+```
+
+Git reuses any resolution already recorded in that clone. Review the staged result and resolve any remaining conflicts. Run the relevant checks before committing. Running `git rerere` after resolving a conflict records the resolution for another run in the same clone.
+
+After a maintainer checks the diffs, preserves any distinct tests, and labels the redundant PR `duplicate`, this command previews the closure. The head SHA must be the one the maintainer reviewed.
+
+```
+python -I triage.py close --pr 123 --canonical 456 --head <full-reviewed-head-sha>
+```
+
+Pass `--apply` from an account with upstream write access to link the canonical PR and close the duplicate. Scheduled Forge runs only report overlaps.
 
 ## Game files
 

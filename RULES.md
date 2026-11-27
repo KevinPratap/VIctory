@@ -22,6 +22,7 @@ A pull request is merged when **all** of these hold:
 6. It does not change `.github/workflows/`. The Actions token cannot push workflow changes, and the Forge does
    not run other people's CI changes unreviewed. Such pull requests are listed as "changes CI workflows".
 7. It is not held (rule 4).
+8. It targets `main`, still has the head the run listed, and adds changes to `main`.
 
 Pull requests are tried **oldest first** (by number). An older one wins a conflict with a newer one. That is a
 fixed order, not a judgement of quality.
@@ -33,6 +34,9 @@ Every open pull request gets one result:
 | Result | Meaning |
 |---|---|
 | in forge | merged (rule 2) |
+| already in main | merging this head leaves the `main` tree unchanged |
+| head changed | the fetched head differs from the listed head |
+| alternate base | the PR targets a branch other than `main` |
 | conflicts with main | fails rule 2.2: rebase onto `main` |
 | conflicts with pull requests | fails rule 2.3: the pull requests named under *with* changed the same files first |
 | breaks the build | fails rule 2.4 or 2.5: the first error is shown |
@@ -41,6 +45,8 @@ Every open pull request gets one result:
 | draft | skipped until ready |
 
 "Since the last run" lists which pull requests joined the branch and which left it.
+
+The overlaps section records matching patch IDs and merge trees, or shows related PRs based on changed files and linked issues or titles. A match is evidence for a reviewer. The status JSON pins the PR head and merge target so a reviewer can recreate a conflict and reuse their clone's recorded Git resolutions.
 
 ## 4. Holds
 
@@ -67,6 +73,8 @@ none, so most GPU tests skip there.
 - It never edits a pull request's code. Each one is merged as its author wrote it, one merge commit each.
 - It never adds anything from the game, or anything the asset policy refuses.
 - It never changes these rules by itself. Changes to the rules or holds are commits to this branch, with a reason.
+
+The local `triage.py close` command is separate from the Forge run. A maintainer can use it after labeling a reviewed PR `duplicate` and choosing a canonical PR. It checks the reviewed head again before closing.
 
 ## 7. Claims
 
