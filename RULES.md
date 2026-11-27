@@ -7,7 +7,8 @@ anyone can predict and check the result.
 
 - Every 12 hours (00:00 and 12:00 UTC), and whenever someone with write access starts the workflow by hand.
 - Each run starts from scratch: upstream `main` as it is at that moment, and the pull requests as they are.
-  Nothing from a previous run is kept except the list of what changed.
+  The last `forge/tested` branch is kept until another candidate passes the regression gate; the previous
+  status is also used to list what changed.
 
 ## 2. What gets into `forge/main`
 
@@ -59,6 +60,29 @@ A hold keeps out a pull request that builds but is known to break the title. Hol
 After merging, the Forge runs `cargo test --workspace --no-fail-fast` on the branch and lists failing tests on the
 status page. A failing test does not keep a pull request out. GPU tests need a GPU, and the automatic runs have
 none, so most GPU tests skip there.
+
+`forge/tested` is a separate promotion gate. The same worker tests the pinned upstream baseline and the
+candidate. Both runs must be complete and have passing tests. No test may newly fail, and every test that
+passed on the baseline must still pass on the candidate; removing or ignoring it blocks promotion. Test
+identities include their Cargo target so duplicate names in different crates are not confused. Existing
+baseline failures are allowed and remain visible. Compilation failures, timeouts, unexplained exits, and
+unrecognised/incomplete test output cannot qualify as a successful run.
+
+On rejection the previous tested branch remains available. A bounded search over merge prefixes reports
+the range between an observed passing prefix and an observed failing prefix. Earlier pull requests may
+interact with that range; nonmonotonic failures and flaky tests need manual confirmation. No hold or
+upstream change is made automatically from this diagnosis. The default limits are six probes and fifteen
+minutes total, with thirty minutes per baseline/candidate run. Setting either diagnostic budget to zero
+disables investigation. Logs and the promotion report are retained as workflow artifacts.
+
+The tested branch means only that these automated checks passed relative to this baseline on this worker.
+It does not certify title behaviour or GPU paths the worker did not exercise. Publication of the tested
+branch is conditional and uses a lease, so a rejected candidate or concurrent publisher cannot silently
+replace the last tested branch.
+
+Candidate code runs in a job with read-only repository permissions and no persisted checkout credential.
+A separate worker holds the write credential, checks that bundled refs match the reports, and publishes
+without checking out or executing candidate code.
 
 ## 6. What the Forge never does
 

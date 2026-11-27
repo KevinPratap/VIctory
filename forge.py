@@ -8,6 +8,7 @@ Usage (from anywhere; needs git >= 2.38, gh, cargo):
     python -I forge.py --repo <VIctory worktree> --out <status folder>
         [--upstream Marvisak/VIctory] [--remote origin] [--branch forge/main]
         [--batch 20] [--held held.json] [--limit N] [--tests] [--previous status.json]
+        [--tested-branch forge/tested] [--diagnostic-runs 6] [--diagnostic-seconds 900]
 
 --tests runs `cargo test --workspace --no-fail-fast` on the final branch and
 reports it; --previous names the last run's status.json, to list what changed.
@@ -27,8 +28,18 @@ ap.add_argument("--batch", type=int, default=20)
 ap.add_argument("--held", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "held.json"))
 ap.add_argument("--limit", type=int, default=0, help="only the first N pull requests (testing)")
 ap.add_argument("--tests", action="store_true", help="run the workspace tests on the final branch")
+ap.add_argument("--tested-branch", help="advance this branch only after baseline regression checks (requires --tests)")
+ap.add_argument("--test-timeout", type=int, default=1800, help="seconds per baseline/candidate test run")
+ap.add_argument("--diagnostic-runs", type=int, default=6, help="maximum regression-isolation probes")
+ap.add_argument("--diagnostic-seconds", type=int, default=900, help="total seconds for isolation probes")
 ap.add_argument("--previous", help="the last run's status.json, to report what changed")
 a = ap.parse_args()
+if a.tested_branch and not a.tests:
+    ap.error("--tested-branch requires --tests")
+if a.tested_branch == a.branch:
+    ap.error("--tested-branch must differ from the candidate branch")
+if a.test_timeout <= 0 or a.diagnostic_runs < 0 or a.diagnostic_seconds < 0:
+    ap.error("test timeout must be positive and diagnostic budgets nonnegative")
 os.makedirs(a.out, exist_ok=True)
 LOG = open(os.path.join(a.out, "forge.log"), "a", encoding="utf-8")
 
@@ -225,10 +236,21 @@ log(f"done: {len(merged)} pull requests in {a.branch} at {good}")
 
 # Tests on the final branch.
 tests = None
-if a.tests:
+promotion = None
+if a.tested_branch:
+    subprocess.run([sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "promotion.py"),
+                    "--repo", a.repo, "--out", a.out, "--base", base, "--head", good,
+                    "--branch", a.tested_branch, "--test-timeout", str(a.test_timeout),
+                    "--diagnostic-runs", str(a.diagnostic_runs),
+                    "--diagnostic-seconds", str(a.diagnostic_seconds)], check=True)
+    with open(os.path.join(a.out, "promotion.json"), encoding="utf-8") as stream:
+        promotion = json.load(stream)
+    tests = promotion["candidate"]
+    log("tested branch", "promoted" if promotion["promoted"] else "preserved")
+elif a.tests:
     import re
     r = subprocess.run(["cargo", "test", "--workspace", "--no-fail-fast"], cwd=a.repo,
-                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=7200)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=a.test_timeout)
     out = r.stdout + r.stderr
     count = lambda w: sum(int(x) for x in re.findall(rf"(\d+) {w}", out))
     tests = {"passed": count("passed"), "failed": count("failed"), "ignored": count("ignored"),
@@ -248,6 +270,7 @@ for p in prs:
 order = ["in forge", "conflicts with pull requests", "conflicts with main", "breaks the build",
          "changes CI workflows", "held", "draft", "not fetched", "error", "?"]
 json.dump({"generated": now, "base": base, "head": good, "branch": a.branch, "tests": tests,
+           "promotion": promotion,
            "status": {p["number"]: status.get(p["number"]) for p in prs}},
           open(os.path.join(a.out, "status.json"), "w", encoding="utf-8"), indent=1)
 
@@ -271,6 +294,24 @@ if tests is not None:
            f"{tests['ignored']} ignored** (on the machine that ran the Forge; GPU tests skip where it has no GPU). "
            "Test failures do not keep a pull request out; they are listed for the authors.", ""]
     md += [f"- `{f}`" for f in tests["failing"]] + [""]
+if promotion is not None:
+    md += ["## Tested branch", "",
+           f"`{cell(promotion['branch'])}`: **{'promoted' if promotion['promoted'] else 'preserved'}**. "
+           "Compared with the same upstream commit on the same worker. "
+           "This is automated test coverage, not validation of a title or untested GPU paths.", ""]
+    baseline = promotion["baseline"]
+    md += [f"Baseline: **{baseline['passed']} passed, {baseline['failed']} failed, "
+           f"{baseline['ignored']} ignored**. Complete: `{baseline['complete']}`.", ""]
+    for label, key in (("Reasons", "reasons"), ("New failures", "new_failures"),
+                       ("Previously passing tests no longer passing", "missing_passes")):
+        if promotion.get(key):
+            md += [f"{label}:", ""] + [f"- {cell(value)}" for value in promotion[key]] + [""]
+    diagnosis = promotion.get("diagnosis")
+    if diagnosis:
+        md += [f"Suspect range: `{diagnosis['last_passing'][:10]}` to "
+               f"`{diagnosis['first_failing'][:10]}` after {len(diagnosis['probes'])} probes.", ""]
+        md += [f"- `{item['commit'][:10]}` {cell(item['subject'])}" for item in diagnosis["suspects"]]
+        md += ["", diagnosis["note"], ""]
 if previous:
     was_in = {int(k) for k, v in previous.items() if v and v.get("result") == "in forge"}
     now_in = set(merged)

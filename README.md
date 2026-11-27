@@ -7,6 +7,8 @@ The Forge does that for everyone:
 
 - **`forge/main`**: upstream `main` plus every open pull request that merges cleanly and still builds, one merge
   commit per pull request (`Forge: #N title`), oldest first. Check it out and test the combined state.
+- **`forge/tested`**: the last candidate whose tests introduced no new failures against the same upstream
+  baseline on the same worker. Incomplete runs and missing previously passing tests block promotion.
 - **[STATUS.md](STATUS.md)**: what happened to each open pull request.
 - **[forge.py](forge.py)**: the tool that builds both. Run it yourself; it needs only git, `gh` and cargo.
 
@@ -39,23 +41,39 @@ with pull requests" is not a judgement; it shows who else is working in the same
 
 1. List the open pull requests and fetch every head.
 2. Check each one against `main` with `git merge-tree` (no checkout).
-3. Merge the ones that merge cleanly into a fresh branch from `main`, 25 at a time, and run
-   `cargo check --workspace --all-targets` and `cargo xtask policy` after each batch. If a batch fails, its pull requests are redone one
-   at a time and the ones that break the build are left out.
-4. Run the workspace tests on the result, then write `STATUS.md` and `status.json`, including what changed since
-   the last run.
+3. Merge the ones that merge cleanly into a fresh branch from `main`, 20 at a time, and run
+   `cargo check --workspace --all-targets` and `cargo xtask policy` after each batch. If a batch fails,
+   recursively split it and leave out the pull requests that break the build.
+4. Run the workspace tests on both the pinned upstream baseline and the candidate. Advance `forge/tested`
+   only if both runs are complete, no new test fails, and every baseline passing test still passes.
+5. For a rejected candidate, probe a bounded number of merge prefixes and report a suspect range. Earlier
+   changes can interact with this range: it is a diagnostic lead, not proof of a single bad pull request.
+6. Write `STATUS.md` and `status.json`, including what changed since the last run and the promotion verdict.
 
-Only the build and the asset policy gate a merge: the GPU tests need a GPU, and running them per pull request would
-take days. The tests of the final branch are run once and reported in `STATUS.md`.
+Only the build and asset policy gate inclusion in `forge/main`. Test regressions gate `forge/tested`, so a
+rejected candidate leaves the last tested branch available. This is worker-specific automated coverage;
+ignored tests and GPU paths skipped internally do not establish that the title runs correctly.
 
 ## Run it yourself
 
 ```
 git worktree add --detach ../VIctory-forge origin/main
 python -I forge.py --repo ../VIctory-forge --out <folder outside the repo>
+python -I forge.py --repo ../VIctory-forge --out <folder outside the repo> --tests --tested-branch forge/tested
 ```
 
 Use a worktree of its own: the tool resets it. With `--limit 25` it tries only the first 25 pull requests.
+
+`--test-timeout 1800` bounds each baseline/candidate run. Regression investigation has both a run budget
+(`--diagnostic-runs 6`) and a time budget (`--diagnostic-seconds 900`); set either diagnostic budget to zero
+to disable probes. Full logs and `promotion.json` accompany the status report as workflow artifacts. An
+existing tested ref is updated atomically, and publication uses a lease to avoid replacing a concurrent update.
+CI executes candidate code in a job with read-only repository access and no persisted checkout credential.
+A separate publisher imports the resulting Git bundle and reports without checking out or executing candidate
+code with its write credential.
+
+Run the source-only promotion tests with `python -I test_promotion.py -v`. They use synthetic test output
+and disposable Git repositories, without Cargo, game data, a GPU, or network access.
 
 ## Game files
 
